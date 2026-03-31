@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Z80 Tracer - Wiring Guide</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+#toolbar { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; background: #16213e; border-bottom: 1px solid #333; flex-shrink: 0; gap: 12px; flex-wrap: wrap; }
+#phase-label { font-size: 14px; font-weight: 600; padding: 4px 12px; border-radius: 4px; white-space: nowrap; }
+#wire-counter { font-size: 14px; color: #aaa; white-space: nowrap; }
+.nav-btns { display: flex; gap: 6px; }
+.nav-btns button { background: #2a2a4a; color: #e0e0e0; border: 1px solid #444; padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+.nav-btns button:hover { background: #3a3a5a; }
+.nav-btns button:disabled { opacity: 0.3; cursor: default; }
+#svg-container { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 8px; }
+#board { width: 100%; height: 100%; }
+#info-panel { display: flex; align-items: center; gap: 20px; padding: 10px 20px; background: #16213e; border-top: 1px solid #333; flex-shrink: 0; min-height: 60px; flex-wrap: wrap; }
+#info-signal { font-size: 22px; font-weight: 700; min-width: 80px; }
+.info-detail { font-size: 13px; color: #aaa; }
+.info-detail b { color: #e0e0e0; font-size: 15px; }
+#info-hint { font-size: 13px; color: #888; margin-left: auto; max-width: 350px; }
+.kbd { display: inline-block; background: #2a2a4a; border: 1px solid #444; border-radius: 3px; padding: 1px 6px; font-size: 11px; font-family: monospace; color: #aaa; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <span id="phase-label">Ready</span>
+  <span id="wire-counter">Press Next to begin</span>
+  <div class="nav-btns">
+    <button id="btn-prev" disabled onclick="navigate(-1)">&larr; Prev</button>
+    <button id="btn-next" onclick="navigate(1)">Next &rarr;</button>
+  </div>
+</div>
+<div id="svg-container">
+  <svg id="board" viewBox="0 0 1200 720"></svg>
+</div>
+<div id="info-panel">
+  <span id="info-signal">--</span>
+  <span class="info-detail">Z80 pin: <b id="info-z80">--</b></span>
+  <span class="info-detail">PGA grid: <b id="info-pga">--</b></span>
+  <span class="info-detail">GPIO: <b id="info-gpio">--</b></span>
+  <span id="info-hint">Use <span class="kbd">&larr;</span> <span class="kbd">&rarr;</span> arrow keys to navigate</span>
+</div>
+
+<script>
+// ===== WIRING DATA =====
+const PHASES = [
+  { name: "Address Bus Low (A0\u2013A10)", color: "#60a5fa", wires: [
+    { signal:"A0",  z80pin:30, gpio:"GP0",  pgaGrid:"B3",  row:1, col:3  },
+    { signal:"A1",  z80pin:31, gpio:"GP1",  pgaGrid:"A2",  row:0, col:2  },
+    { signal:"A2",  z80pin:32, gpio:"GP2",  pgaGrid:"B1",  row:1, col:1  },
+    { signal:"A3",  z80pin:33, gpio:"GP3",  pgaGrid:"C2",  row:2, col:2  },
+    { signal:"A4",  z80pin:34, gpio:"GP4",  pgaGrid:"C1",  row:2, col:1  },
+    { signal:"A5",  z80pin:35, gpio:"GP5",  pgaGrid:"D2",  row:3, col:2  },
+    { signal:"A6",  z80pin:36, gpio:"GP6",  pgaGrid:"D1",  row:3, col:1  },
+    { signal:"A7",  z80pin:37, gpio:"GP7",  pgaGrid:"E2",  row:4, col:2  },
+    { signal:"A8",  z80pin:38, gpio:"GP8",  pgaGrid:"E1",  row:4, col:1  },
+    { signal:"A9",  z80pin:39, gpio:"GP9",  pgaGrid:"F2",  row:5, col:2  },
+    { signal:"A10", z80pin:40, gpio:"GP10", pgaGrid:"F1",  row:5, col:1  },
+  ]},
+  { name: "Address Bus High (A11\u2013A15)", color: "#818cf8", wires: [
+    { signal:"A11", z80pin:1,  gpio:"GP11", pgaGrid:"G2",  row:6, col:2  },
+    { signal:"A12", z80pin:2,  gpio:"GP12", pgaGrid:"G1",  row:6, col:1  },
+    { signal:"A13", z80pin:3,  gpio:"GP13", pgaGrid:"H2",  row:7, col:2  },
+    { signal:"A14", z80pin:4,  gpio:"GP14", pgaGrid:"H1",  row:7, col:1  },
+    { signal:"A15", z80pin:5,  gpio:"GP15", pgaGrid:"I2",  row:8, col:2  },
+  ]},
+  { name: "Data Bus (D0\u2013D7)", color: "#34d399", wires: [
+    { signal:"D0",  z80pin:14, gpio:"GP16", pgaGrid:"I1",  row:8, col:1  },
+    { signal:"D1",  z80pin:15, gpio:"GP17", pgaGrid:"J2",  row:9, col:2  },
+    { signal:"D2",  z80pin:12, gpio:"GP18", pgaGrid:"J3",  row:9, col:3  },
+    { signal:"D3",  z80pin:8,  gpio:"GP19", pgaGrid:"J4",  row:9, col:4  },
+    { signal:"D4",  z80pin:7,  gpio:"GP20", pgaGrid:"I3",  row:8, col:3  },
+    { signal:"D5",  z80pin:9,  gpio:"GP21", pgaGrid:"I4",  row:8, col:4  },
+    { signal:"D6",  z80pin:10, gpio:"GP22", pgaGrid:"I5",  row:8, col:5  },
+    { signal:"D7",  z80pin:13, gpio:"GP23", pgaGrid:"J5",  row:9, col:5  },
+  ]},
+  { name: "Control Signals", color: "#fb923c", wires: [
+    { signal:"/M1",   z80pin:27, gpio:"GP24", pgaGrid:"J6",  row:9, col:6  },
+    { signal:"/MREQ", z80pin:19, gpio:"GP25", pgaGrid:"I6",  row:8, col:6  },
+    { signal:"/IORQ", z80pin:20, gpio:"GP26", pgaGrid:"J7",  row:9, col:7  },
+    { signal:"/RD",   z80pin:21, gpio:"GP27", pgaGrid:"I7",  row:8, col:7  },
+    { signal:"/WR",   z80pin:22, gpio:"GP28", pgaGrid:"I8",  row:8, col:8  },
+    { signal:"/RFSH", z80pin:28, gpio:"GP29", pgaGrid:"J8",  row:9, col:8  },
+    { signal:"CLK",   z80pin:6,  gpio:"GP30", pgaGrid:"J9",  row:9, col:9  },
+    { signal:"/HALT", z80pin:18, gpio:"GP31", pgaGrid:"I9",  row:8, col:9  },
+    { signal:"/WAIT", z80pin:24, gpio:"GP32", pgaGrid:"I10", row:8, col:10 },
+  ]},
+  { name: "Power & Ground", color: "#f87171", wires: [
+    { signal:"GND",  z80pin:29, gpio:"GND",  pgaGrid:"A1",  row:0, col:1  },
+    { signal:"3V3",  z80pin:11, gpio:"3V3",  pgaGrid:"B4",  row:1, col:4  },
+  ]},
+];
+
+// Flatten
+const allWires = [];
+const wirePhaseIndex = [];
+PHASES.forEach((phase, pi) => {
+  phase.wires.forEach(w => { allWires.push(w); wirePhaseIndex.push(pi); });
+});
+const TOTAL = allWires.length;
+
+// ===== LAYOUT CONSTANTS =====
+const Z80_X = 200;         // center-x of Z80 socket
+const Z80_Y_START = 80;    // y of first pin row
+const Z80_PIN_SPACING = 28;
+const Z80_COL_GAP = 80;    // gap between the two DIP columns
+
+const PGA_X_START = 580;   // x of rightmost column (col 1 in bottom view is on the right!)
+const PGA_Y_START = 90;
+const PGA_SPACING = 28;
+
+// Z80 pin coordinates (BOTTOM VIEW)
+// Bottom view: pins 1-20 run down the RIGHT column, pins 21-40 run UP the LEFT column
+function z80XY(pin) {
+  if (pin >= 1 && pin <= 20) {
+    return { x: Z80_X + Z80_COL_GAP/2, y: Z80_Y_START + (pin - 1) * Z80_PIN_SPACING };
+  } else {
+    return { x: Z80_X - Z80_COL_GAP/2, y: Z80_Y_START + (40 - pin) * Z80_PIN_SPACING };
+  }
+}
+
+// PGA pin coordinates (BOTTOM VIEW: column 1 is on the RIGHT, column 10 on the LEFT)
+function pgaXY(row, col) {
+  return {
+    x: PGA_X_START - (col - 1) * PGA_SPACING,  // mirror: col 1 rightmost
+    y: PGA_Y_START + row * PGA_SPACING
+  };
+}
+
+// ===== Z80 SIGNAL NAMES =====
+const Z80_SIGNALS = {
+  1:"A11",2:"A12",3:"A13",4:"A14",5:"A15",6:"CLK",
+  7:"D4",8:"D3",9:"D5",10:"D6",11:"+5V",12:"D2",13:"D7",
+  14:"D0",15:"D1",16:"/INT",17:"/NMI",18:"/HALT",19:"/MREQ",
+  20:"/IORQ",21:"/RD",22:"/WR",23:"/BUSACK",24:"/WAIT",
+  25:"/BUSRQ",26:"/RESET",27:"/M1",28:"/RFSH",29:"GND",
+  30:"A0",31:"A1",32:"A2",33:"A3",34:"A4",35:"A5",
+  36:"A6",37:"A7",38:"A8",39:"A9",40:"A10"
+};
+
+// Which Z80 pins are wired (to dim vs show)
+const wiredZ80Pins = new Set(allWires.map(w => w.z80pin));
+
+// PGA populated positions
+const PGA_PINS = [
+  [0,1,"GND"],[0,2,"GP1"],[0,3,"VBUS"],[0,4,"3V3_EN"],[0,5,"RUN"],
+  [0,6,"USB_DP"],[0,7,"USB_DM"],[0,8,"BOOTSEL"],[0,9,"GP46"],
+  [1,1,"GP2"],[1,3,"GP0"],[1,4,"3V3"],[1,5,"ADC_VRF"],[1,6,"SWCLK"],
+  [1,7,"SWDIO"],[1,8,"GP47"],[1,10,"GP45"],
+  [2,1,"GP4"],[2,2,"GP3"],[2,9,"GP43"],[2,10,"GP44"],
+  [3,1,"GP6"],[3,2,"GP5"],[3,9,"GP42"],[3,10,"GP41"],
+  [4,1,"GP8"],[4,2,"GP7"],[4,9,"GP39"],[4,10,"GP40"],
+  [5,1,"GP10"],[5,2,"GP9"],[5,9,"GP37"],[5,10,"GP38"],
+  [6,1,"GP12"],[6,2,"GP11"],[6,9,"GP35"],[6,10,"GP36"],
+  [7,1,"GP14"],[7,2,"GP13"],[7,9,"GP33"],[7,10,"GP34"],
+  [8,1,"GP16"],[8,2,"GP15"],[8,3,"GP20"],[8,4,"GP21"],
+  [8,5,"GP22"],[8,6,"GP25"],[8,7,"GP27"],[8,8,"GP28"],
+  [8,9,"GP31"],[8,10,"GP32"],
+  [9,2,"GP17"],[9,3,"GP18"],[9,4,"GP19"],[9,5,"GP23"],
+  [9,6,"GP24"],[9,7,"GP26"],[9,8,"GP29"],[9,9,"GP30"],
+];
+const PGA_ROW_LABELS = "ABCDEFGHIJ";
+
+// ===== SVG HELPERS =====
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("board");
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+
+function svgText(x, y, text, attrs = {}) {
+  const el = svgEl("text", { x, y, "font-size": attrs.fontSize || 9, fill: attrs.fill || "#888", "text-anchor": attrs.anchor || "middle", "dominant-baseline": "central", "font-family": "monospace", ...attrs });
+  el.textContent = text;
+  return el;
+}
+
+// ===== RENDER STATIC ELEMENTS =====
+function initSVG() {
+  // Perfboard background
+  const defs = svgEl("defs", {});
+  const pattern = svgEl("pattern", { id:"dots", width:PGA_SPACING, height:PGA_SPACING, patternUnits:"userSpaceOnUse" });
+  pattern.appendChild(svgEl("circle", { cx:PGA_SPACING/2, cy:PGA_SPACING/2, r:1.5, fill:"#3a3520" }));
+  defs.appendChild(pattern);
+  svg.appendChild(defs);
+
+  // Board rect
+  svg.appendChild(svgEl("rect", { x:30, y:30, width:1140, height:660, rx:8, fill:"#2d2b1f", stroke:"#4a4530", "stroke-width":2 }));
+  svg.appendChild(svgEl("rect", { x:30, y:30, width:1140, height:660, rx:8, fill:"url(#dots)" }));
+
+  // --- Z80 Socket ---
+  const z80g = svgEl("g", { id:"z80-socket" });
+  // Socket outline
+  const sLeft = Z80_X - Z80_COL_GAP/2 - 16;
+  const sTop = Z80_Y_START - 20;
+  const sW = Z80_COL_GAP + 32;
+  const sH = 19 * Z80_PIN_SPACING + 40;
+  z80g.appendChild(svgEl("rect", { x:sLeft, y:sTop, width:sW, height:sH, rx:4, fill:"#1a1a1a", stroke:"#555", "stroke-width":1.5 }));
+  // Pin 1 notch (top-right in bottom view, which is where pin 1 sits)
+  z80g.appendChild(svgEl("circle", { cx: Z80_X + Z80_COL_GAP/2, cy: sTop + 10, r: 5, fill:"none", stroke:"#666", "stroke-width":1 }));
+  // Label
+  z80g.appendChild(svgText(Z80_X, sTop - 8, "Z80 DIP-40 (bottom view)", { fontSize:11, fill:"#999" }));
+
+  // Pins
+  for (let pin = 1; pin <= 40; pin++) {
+    const { x, y } = z80XY(pin);
+    const isWired = wiredZ80Pins.has(pin);
+    z80g.appendChild(svgEl("circle", { cx:x, cy:y, r:5, fill: isWired ? "#444" : "#2a2a2a", stroke: isWired ? "#666" : "#3a3a3a", "stroke-width":1, id:`z80-pin-${pin}` }));
+    // Pin number (outside the socket)
+    const numX = pin <= 20 ? x + 14 : x - 14;
+    z80g.appendChild(svgText(numX, y, pin, { fontSize:8, fill:"#666", anchor: pin <= 20 ? "start" : "end" }));
+    // Signal name (further outside)
+    const sigX = pin <= 20 ? x + 38 : x - 38;
+    const sig = Z80_SIGNALS[pin] || "";
+    z80g.appendChild(svgText(sigX, y, sig, { fontSize:8, fill: isWired ? "#999" : "#444", anchor: pin <= 20 ? "start" : "end", id:`z80-label-${pin}` }));
+  }
+  svg.appendChild(z80g);
+
+  // --- PGA Socket ---
+  const pgag = svgEl("g", { id:"pga-socket" });
+  // Socket outline
+  const pRight = PGA_X_START + 16;
+  const pTop = PGA_Y_START - 16;
+  const pW = 9 * PGA_SPACING + 32;
+  const pH = 9 * PGA_SPACING + 32;
+  pgag.appendChild(svgEl("rect", { x: pRight - pW, y: pTop, width: pW, height: pH, rx:4, fill:"#1a1a1a", stroke:"#555", "stroke-width":1.5 }));
+  // Pin A1 marker (row 0, col 1 -> top-right in bottom view)
+  const a1 = pgaXY(0, 1);
+  pgag.appendChild(svgEl("circle", { cx: a1.x, cy: pTop + 8, r: 3, fill:"#666" }));
+  // Label
+  pgag.appendChild(svgText(pRight - pW/2, pTop - 8, "PGA2350 (bottom view)", { fontSize:11, fill:"#999" }));
+
+  // Row labels (right side in bottom view, since row labels are on the col-1 side)
+  for (let r = 0; r < 10; r++) {
+    const ry = PGA_Y_START + r * PGA_SPACING;
+    pgag.appendChild(svgText(PGA_X_START + 16, ry, PGA_ROW_LABELS[r], { fontSize:8, fill:"#666" }));
+  }
+  // Col labels (bottom, mirrored)
+  for (let c = 1; c <= 10; c++) {
+    const cx = PGA_X_START - (c - 1) * PGA_SPACING;
+    pgag.appendChild(svgText(cx, PGA_Y_START + 9 * PGA_SPACING + 16, c, { fontSize:8, fill:"#666" }));
+  }
+
+  // Pins
+  for (const [row, col, label] of PGA_PINS) {
+    const { x, y } = pgaXY(row, col);
+    const isPower = label === "GND" || label === "3V3" || label === "VBUS" || label === "3V3_EN" || label === "ADC_VRF";
+    const isSystem = label === "SWCLK" || label === "SWDIO" || label === "RUN" || label === "BOOTSEL" || label === "USB_DP" || label === "USB_DM";
+    let pinFill = "#444";
+    if (isPower) pinFill = "#4a2020";
+    else if (isSystem) pinFill = "#2a2a3a";
+    pgag.appendChild(svgEl("circle", { cx:x, cy:y, r:5, fill:pinFill, stroke:"#555", "stroke-width":1, id:`pga-pin-${row}-${col}` }));
+    // Label
+    pgag.appendChild(svgText(x, y - 10, label, { fontSize:7, fill:"#777", id:`pga-label-${row}-${col}` }));
+  }
+  svg.appendChild(pgag);
+
+  // Wire layer
+  svg.appendChild(svgEl("g", { id:"wire-layer" }));
+  // Highlight layer
+  svg.appendChild(svgEl("g", { id:"highlight-layer" }));
+
+  // Legend
+  const legendY = 640;
+  const legendItems = [
+    ["Address Bus", "#60a5fa"], ["Data Bus", "#34d399"],
+    ["Control", "#fb923c"], ["Power/GND", "#f87171"]
+  ];
+  legendItems.forEach(([label, color], i) => {
+    const lx = 80 + i * 160;
+    svg.appendChild(svgEl("line", { x1:lx, y1:legendY, x2:lx+24, y2:legendY, stroke:color, "stroke-width":3, "stroke-linecap":"round" }));
+    svg.appendChild(svgText(lx + 36, legendY, label, { fontSize:10, fill:color, anchor:"start" }));
+  });
+
+  // Bottom view reminder
+  svg.appendChild(svgText(600, 680, "VIEW FROM BOTTOM (solder side) \u2014 columns are mirrored vs. top view", { fontSize:10, fill:"#665" }));
+}
+
+// ===== RENDER WIRES =====
+let currentIndex = -1; // -1 = nothing shown yet
+
+function renderWires() {
+  const wireLayer = document.getElementById("wire-layer");
+  const highlightLayer = document.getElementById("highlight-layer");
+  wireLayer.innerHTML = "";
+  highlightLayer.innerHTML = "";
+
+  // Reset all pin fills
+  for (let pin = 1; pin <= 40; pin++) {
+    const el = document.getElementById(`z80-pin-${pin}`);
+    if (el) el.setAttribute("fill", wiredZ80Pins.has(pin) ? "#444" : "#2a2a2a");
+  }
+  for (const [row, col] of PGA_PINS) {
+    const el = document.getElementById(`pga-pin-${row}-${col}`);
+    if (el) el.setAttribute("fill", "#444");
+  }
+
+  allWires.forEach((wire, i) => {
+    if (i > currentIndex) return; // future: hidden
+
+    const z = z80XY(wire.z80pin);
+    const p = pgaXY(wire.row, wire.col);
+    const phase = PHASES[wirePhaseIndex[i]];
+    const isCurrent = (i === currentIndex);
+
+    // Bezier control point: offset to fan wires apart
+    const midX = (z.x + p.x) / 2;
+    const midY = (z.y + p.y) / 2;
+    const offsetY = ((i % 7) - 3) * 8;
+
+    const path = svgEl("path", {
+      d: `M ${z.x},${z.y} Q ${midX},${midY + offsetY} ${p.x},${p.y}`,
+      fill: "none",
+      stroke: phase.color,
+      "stroke-width": isCurrent ? 3 : 1.5,
+      "stroke-linecap": "round",
+      opacity: isCurrent ? 1 : 0.3,
+    });
+    wireLayer.appendChild(path);
+
+    if (isCurrent) {
+      // Highlight Z80 endpoint
+      highlightLayer.appendChild(svgEl("circle", {
+        cx:z.x, cy:z.y, r:8, fill:phase.color, opacity:0.3
+      }));
+      highlightLayer.appendChild(svgEl("circle", {
+        cx:z.x, cy:z.y, r:5, fill:phase.color, opacity:0.9
+      }));
+      // Z80 pin label highlight
+      const zLabel = svgText(
+        wire.z80pin <= 20 ? z.x + 52 : z.x - 52,
+        z.y,
+        `pin ${wire.z80pin}: ${wire.signal}`,
+        { fontSize:11, fill:phase.color, fontWeight:"bold", anchor: wire.z80pin <= 20 ? "start" : "end" }
+      );
+      highlightLayer.appendChild(zLabel);
+
+      // Highlight PGA endpoint
+      highlightLayer.appendChild(svgEl("circle", {
+        cx:p.x, cy:p.y, r:8, fill:phase.color, opacity:0.3
+      }));
+      highlightLayer.appendChild(svgEl("circle", {
+        cx:p.x, cy:p.y, r:5, fill:phase.color, opacity:0.9
+      }));
+      // PGA pin label highlight
+      highlightLayer.appendChild(svgText(p.x, p.y - 16, `${wire.pgaGrid} (${wire.gpio})`, {
+        fontSize:11, fill:phase.color, fontWeight:"bold"
+      }));
+
+      // Highlight the pin circles
+      const z80el = document.getElementById(`z80-pin-${wire.z80pin}`);
+      if (z80el) { z80el.setAttribute("fill", phase.color); z80el.setAttribute("r", "6"); }
+      const pgael = document.getElementById(`pga-pin-${wire.row}-${wire.col}`);
+      if (pgael) { pgael.setAttribute("fill", phase.color); pgael.setAttribute("r", "6"); }
+    } else {
+      // Completed: color the pins dimly
+      const z80el = document.getElementById(`z80-pin-${wire.z80pin}`);
+      if (z80el) z80el.setAttribute("fill", phase.color.replace(")", ",0.4)").replace("rgb", "rgba"));
+      const pgael = document.getElementById(`pga-pin-${wire.row}-${wire.col}`);
+      if (pgael) pgael.setAttribute("fill", phase.color.replace(")", ",0.4)").replace("rgb", "rgba"));
+    }
+  });
+
+  // Update UI
+  updateUI();
+}
+
+function updateUI() {
+  const phaseLabel = document.getElementById("phase-label");
+  const wireCounter = document.getElementById("wire-counter");
+  const btnPrev = document.getElementById("btn-prev");
+  const btnNext = document.getElementById("btn-next");
+
+  btnPrev.disabled = currentIndex <= -1;
+  btnNext.disabled = currentIndex >= TOTAL - 1;
+
+  if (currentIndex < 0) {
+    phaseLabel.textContent = "Ready";
+    phaseLabel.style.background = "#333";
+    phaseLabel.style.color = "#aaa";
+    wireCounter.textContent = `${TOTAL} wires total \u2014 press Next to begin`;
+    document.getElementById("info-signal").textContent = "--";
+    document.getElementById("info-z80").textContent = "--";
+    document.getElementById("info-pga").textContent = "--";
+    document.getElementById("info-gpio").textContent = "--";
+    return;
+  }
+
+  const wire = allWires[currentIndex];
+  const phase = PHASES[wirePhaseIndex[currentIndex]];
+
+  phaseLabel.textContent = phase.name;
+  phaseLabel.style.background = phase.color + "22";
+  phaseLabel.style.color = phase.color;
+  wireCounter.textContent = `Wire ${currentIndex + 1} of ${TOTAL}`;
+
+  document.getElementById("info-signal").textContent = wire.signal;
+  document.getElementById("info-signal").style.color = phase.color;
+  document.getElementById("info-z80").textContent = `Pin ${wire.z80pin} (${wire.z80pin <= 20 ? "right col" : "left col"})`;
+  document.getElementById("info-pga").textContent = `${wire.pgaGrid} (row ${PGA_ROW_LABELS[wire.row]}, col ${wire.col})`;
+  document.getElementById("info-gpio").textContent = wire.gpio;
+}
+
+function navigate(delta) {
+  const next = currentIndex + delta;
+  if (next < -1 || next >= TOTAL) return;
+  currentIndex = next;
+  renderWires();
+}
+
+// Keyboard
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight" || e.key === " ") { e.preventDefault(); navigate(1); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); navigate(-1); }
+  else if (e.key === "Home") { e.preventDefault(); currentIndex = -1; renderWires(); }
+  else if (e.key === "End") { e.preventDefault(); currentIndex = TOTAL - 1; renderWires(); }
+});
+
+// Init
+initSVG();
+renderWires();
+</script>
+</body>
+</html>
