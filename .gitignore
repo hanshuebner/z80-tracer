@@ -1,0 +1,14 @@
+build/
+__pycache__/
+*.pyc
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
+.vscode/
+.idea/
+cmake-build-*/
+*.o
+*.d
