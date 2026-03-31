@@ -15,6 +15,9 @@
 // GPIO 30:    CLK          (Z80 clock)
 // GPIO 31:    /HALT        (halt status, directly monitored)
 // GPIO 32:    /WAIT        (active low OUTPUT - directly driven to throttle Z80)
+// GPIO 33:    /INT         (interrupt request, directly monitored)
+// GPIO 34:    /NMI         (non-maskable interrupt, directly monitored)
+// GPIO 35:    /RESET       (reset, directly monitored)
 
 #define PIN_ADDR_BASE   0   // A0 = GPIO 0, A15 = GPIO 15
 #define PIN_DATA_BASE   16  // D0 = GPIO 16, D7 = GPIO 23
@@ -27,6 +30,9 @@
 #define PIN_CLK         30
 #define PIN_HALT        31
 #define PIN_WAIT        32  // output
+#define PIN_INT         33
+#define PIN_NMI         34
+#define PIN_RESET       35
 
 #define PIN_IN_BASE     0   // PIO in_base: GPIO 0
 #define PIN_IN_COUNT    31  // capture GPIO 0-30 (31 pins)
