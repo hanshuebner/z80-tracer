@@ -9,16 +9,12 @@
 #include "z80_trace.h"
 #include "z80_trace.pio.h"
 
-// Ring buffer shared between DMA (writer) and main loop (reader)
+// Ring buffer: DMA writes PIO samples here, ARM reads and classifies
 static uint32_t __attribute__((aligned(CAPTURE_BUF_SIZE_BYTES)))
-    read_buf[CAPTURE_BUF_SIZE_WORDS];
-static uint32_t __attribute__((aligned(CAPTURE_BUF_SIZE_BYTES)))
-    write_buf[CAPTURE_BUF_SIZE_WORDS];
+    sample_buf[CAPTURE_BUF_SIZE_WORDS];
+static uint32_t sample_tail = 0;
 
-static uint32_t read_buf_tail = 0;
-static uint32_t write_buf_tail = 0;
-
-// Flow control state
+// Flow control
 static bool wait_asserted = false;
 
 // ---- GPIO setup ----
@@ -42,97 +38,139 @@ static void gpio_setup(void) {
         gpio_set_dir(ctrl_pins[i], GPIO_IN);
         gpio_disable_pulls(ctrl_pins[i]);
     }
-    // /WAIT: high-Z by default (input, no pulls).
-    // Only driven low (output) when asserting flow control.
-    // The host system's pull-up holds it high when we're not driving.
     gpio_init(PIN_WAIT);
     gpio_set_dir(PIN_WAIT, GPIO_IN);
     gpio_disable_pulls(PIN_WAIT);
-    gpio_put(PIN_WAIT, 0);  // pre-set output latch to LOW so switching
-                              // to output mode immediately asserts /WAIT
+    gpio_put(PIN_WAIT, 0);
 }
 
 // ---- PIO setup ----
 
 static PIO pio = pio0;
-static uint sm_read;
-static uint sm_write;
-static uint offset_rd;
-static uint offset_wr;
+static uint sm;
+static uint pio_offset;
 
 static void pio_setup(void) {
-    offset_rd = pio_add_program(pio, &z80_read_capture_program);
-    sm_read = pio_claim_unused_sm(pio, true);
-    pio_sm_config cfg_rd = z80_read_capture_program_get_default_config(offset_rd);
-    sm_config_set_in_pins(&cfg_rd, PIN_IN_BASE);
-    sm_config_set_jmp_pin(&cfg_rd, PIN_RFSH);
-    sm_config_set_in_shift(&cfg_rd, false, false, 31);
-    pio_sm_init(pio, sm_read, offset_rd, &cfg_rd);
-
-    offset_wr = pio_add_program(pio, &z80_write_capture_program);
-    sm_write = pio_claim_unused_sm(pio, true);
-    pio_sm_config cfg_wr = z80_write_capture_program_get_default_config(offset_wr);
-    sm_config_set_in_pins(&cfg_wr, PIN_IN_BASE);
-    sm_config_set_in_shift(&cfg_wr, false, false, 31);
-    pio_sm_init(pio, sm_write, offset_wr, &cfg_wr);
+    pio_offset = pio_add_program(pio, &z80_bus_sample_program);
+    sm = pio_claim_unused_sm(pio, true);
+    pio_sm_config cfg = z80_bus_sample_program_get_default_config(pio_offset);
+    sm_config_set_in_pins(&cfg, PIN_IN_BASE);
+    sm_config_set_in_shift(&cfg, false, false, 31);
+    pio_sm_init(pio, sm, pio_offset, &cfg);
 }
 
 // ---- DMA setup ----
 
-static int dma_chan_read;
-static int dma_chan_write;
+static int dma_chan;
 
 static void dma_setup(void) {
-    dma_chan_read = dma_claim_unused_channel(true);
-    dma_channel_config c_rd = dma_channel_get_default_config(dma_chan_read);
-    channel_config_set_transfer_data_size(&c_rd, DMA_SIZE_32);
-    channel_config_set_read_increment(&c_rd, false);
-    channel_config_set_write_increment(&c_rd, true);
-    channel_config_set_ring(&c_rd, true, CAPTURE_BUF_RING_BITS);
-    channel_config_set_dreq(&c_rd, pio_get_dreq(pio, sm_read, false));
-    dma_channel_configure(dma_chan_read, &c_rd,
-        read_buf, &pio->rxf[sm_read], 0xFFFFFFFF, false);
-
-    dma_chan_write = dma_claim_unused_channel(true);
-    dma_channel_config c_wr = dma_channel_get_default_config(dma_chan_write);
-    channel_config_set_transfer_data_size(&c_wr, DMA_SIZE_32);
-    channel_config_set_read_increment(&c_wr, false);
-    channel_config_set_write_increment(&c_wr, true);
-    channel_config_set_ring(&c_wr, true, CAPTURE_BUF_RING_BITS);
-    channel_config_set_dreq(&c_wr, pio_get_dreq(pio, sm_write, false));
-    dma_channel_configure(dma_chan_write, &c_wr,
-        write_buf, &pio->rxf[sm_write], 0xFFFFFFFF, false);
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+    channel_config_set_read_increment(&c, false);
+    channel_config_set_write_increment(&c, true);
+    channel_config_set_ring(&c, true, CAPTURE_BUF_RING_BITS);
+    channel_config_set_dreq(&c, pio_get_dreq(pio, sm, false));
+    dma_channel_configure(dma_chan, &c,
+        sample_buf, &pio->rxf[sm], 0xFFFFFFFF, false);
 }
 
 // ---- Helpers ----
 
-static inline uint32_t dma_write_index(int chan, uint32_t *buf) {
-    uint32_t write_addr = dma_channel_hw_addr(chan)->write_addr;
-    return (write_addr - (uint32_t)(uintptr_t)buf) / sizeof(uint32_t);
+static inline uint32_t dma_write_index(void) {
+    uint32_t write_addr = dma_channel_hw_addr(dma_chan)->write_addr;
+    return (write_addr - (uint32_t)(uintptr_t)sample_buf) / sizeof(uint32_t);
 }
 
 static inline uint32_t ring_available(uint32_t head, uint32_t tail) {
     return (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
 }
 
-static void flow_control_update(uint32_t total_pending) {
-    if (!wait_asserted && total_pending >= FLOW_CTRL_ASSERT_THRESHOLD) {
-        gpio_set_dir(PIN_WAIT, GPIO_OUT);  // drive low (asserted)
+static void flow_control_update(uint32_t pending) {
+    if (!wait_asserted && pending >= FLOW_CTRL_ASSERT_THRESHOLD) {
+        gpio_set_dir(PIN_WAIT, GPIO_OUT);
         wait_asserted = true;
-    } else if (wait_asserted && total_pending <= FLOW_CTRL_RELEASE_THRESHOLD) {
-        gpio_set_dir(PIN_WAIT, GPIO_IN);   // release (high-Z)
+    } else if (wait_asserted && pending <= FLOW_CTRL_RELEASE_THRESHOLD) {
+        gpio_set_dir(PIN_WAIT, GPIO_IN);
         wait_asserted = false;
     }
 }
 
+// ---- Bus cycle classifier (runs on ARM) ----
+//
+// Processes raw CLK-edge samples and detects bus cycle boundaries
+// by watching for falling edges of control signals. Captures bus
+// data one CLK cycle after the trigger (when data is valid).
+
+static uint32_t prev_sample = 0xFFFFFFFF;  // all signals inactive
+static bool rd_pending = false;
+static bool wr_pending = false;
+static bool intack_pending = false;
+
+// Returns cycle type or CYCLE_UNKNOWN if this sample isn't a bus cycle
+static cycle_type_t process_sample(uint32_t sample) {
+    cycle_type_t result = CYCLE_UNKNOWN;
+
+    // Delayed captures: emit the bus cycle one CLK after trigger
+    if (intack_pending) {
+        intack_pending = false;
+        int m1   = !(sample & SAMPLE_M1_BIT);
+        int iorq = !(sample & SAMPLE_IORQ_BIT);
+        if (m1 && iorq) result = CYCLE_INT_ACK;
+    } else if (rd_pending) {
+        rd_pending = false;
+        int m1   = !(sample & SAMPLE_M1_BIT);
+        int mreq = !(sample & SAMPLE_MREQ_BIT);
+        int iorq = !(sample & SAMPLE_IORQ_BIT);
+        int rd   = !(sample & SAMPLE_RD_BIT);
+        if (rd) {  // /RD still active
+            if (m1 && mreq)      result = CYCLE_OPCODE_FETCH;
+            else if (mreq)       result = CYCLE_MEM_READ;
+            else if (iorq)       result = CYCLE_IO_READ;
+        }
+    } else if (wr_pending) {
+        wr_pending = false;
+        int mreq = !(sample & SAMPLE_MREQ_BIT);
+        int iorq = !(sample & SAMPLE_IORQ_BIT);
+        int wr   = !(sample & SAMPLE_WR_BIT);
+        if (wr) {
+            if (mreq)            result = CYCLE_MEM_WRITE;
+            else if (iorq)       result = CYCLE_IO_WRITE;
+        }
+    }
+
+    // Detect falling edges (active-low: bit goes from 1 to 0)
+    uint32_t fell = prev_sample & ~sample;
+
+    // INT acknowledge: /IORQ falls while /M1 is already active
+    if ((fell & SAMPLE_IORQ_BIT) && !(sample & SAMPLE_M1_BIT)) {
+        intack_pending = true;
+    }
+    // /RD falling edge (skip if /RFSH is active = refresh cycle)
+    else if ((fell & SAMPLE_RD_BIT) && (sample & SAMPLE_RFSH_BIT)) {
+        rd_pending = true;
+    }
+    // /WR falling edge
+    else if (fell & SAMPLE_WR_BIT) {
+        wr_pending = true;
+    }
+
+    prev_sample = sample;
+    return result;
+}
+
+static void reset_classifier(void) {
+    prev_sample = 0xFFFFFFFF;
+    rd_pending = false;
+    wr_pending = false;
+    intack_pending = false;
+}
+
 // ---- USB output ----
 
-static bool emit_sample(uint32_t sample) {
-    cycle_type_t ct = classify_sample(sample);
+static bool emit_cycle(cycle_type_t ct, uint32_t sample) {
     if (ct == CYCLE_UNKNOWN) return true;
-
-    if (tud_cdc_write_available() < USB_PACKET_SIZE)
-        return false;
+    if (tud_cdc_write_available() < USB_PACKET_SIZE) return false;
 
     uint16_t addr = sample_addr(sample);
     uint8_t data = sample_data(sample);
@@ -146,7 +184,7 @@ static bool emit_sample(uint32_t sample) {
     return true;
 }
 
-// ---- USB text I/O for command mode ----
+// ---- USB text I/O ----
 
 static void usb_puts(const char *s) {
     tud_cdc_write_str(s);
@@ -156,43 +194,24 @@ static void usb_puts(const char *s) {
 // ---- Capture start/stop ----
 
 static void capture_start(void) {
-    // Reset ring buffer tails
-    read_buf_tail = 0;
-    write_buf_tail = 0;
+    sample_tail = 0;
+    reset_classifier();
 
-    // Re-init DMA write pointers to buffer start
-    dma_channel_set_write_addr(dma_chan_read, read_buf, false);
-    dma_channel_set_write_addr(dma_chan_write, write_buf, false);
-    dma_channel_set_trans_count(dma_chan_read, 0xFFFFFFFF, false);
-    dma_channel_set_trans_count(dma_chan_write, 0xFFFFFFFF, false);
+    dma_channel_set_write_addr(dma_chan, sample_buf, false);
+    dma_channel_set_trans_count(dma_chan, 0xFFFFFFFF, false);
 
-    // Clear PIO FIFOs
-    pio_sm_clear_fifos(pio, sm_read);
-    pio_sm_clear_fifos(pio, sm_write);
+    pio_sm_clear_fifos(pio, sm);
+    pio_sm_restart(pio, sm);
+    pio_sm_exec(pio, sm, pio_encode_jmp(pio_offset));
 
-    // Restart PIO state machines from the beginning
-    pio_sm_restart(pio, sm_read);
-    pio_sm_restart(pio, sm_write);
-    pio_sm_exec(pio, sm_read, pio_encode_jmp(offset_rd));
-    pio_sm_exec(pio, sm_write, pio_encode_jmp(offset_wr));
-
-    // Start DMA, then enable PIO
-    dma_channel_start(dma_chan_read);
-    dma_channel_start(dma_chan_write);
-    pio_sm_set_enabled(pio, sm_read, true);
-    pio_sm_set_enabled(pio, sm_write, true);
+    dma_channel_start(dma_chan);
+    pio_sm_set_enabled(pio, sm, true);
 }
 
 static void capture_stop(void) {
-    // Stop PIO state machines
-    pio_sm_set_enabled(pio, sm_read, false);
-    pio_sm_set_enabled(pio, sm_write, false);
+    pio_sm_set_enabled(pio, sm, false);
+    dma_channel_abort(dma_chan);
 
-    // Abort DMA
-    dma_channel_abort(dma_chan_read);
-    dma_channel_abort(dma_chan_write);
-
-    // Release /WAIT (high-Z)
     if (wait_asserted) {
         gpio_set_dir(PIN_WAIT, GPIO_IN);
         wait_asserted = false;
@@ -204,7 +223,6 @@ static void capture_stop(void) {
 int main(void) {
     stdio_init_all();
 
-    // Ensure /WAIT is high-Z so we don't interfere with the bus
     gpio_init(PIN_WAIT);
     gpio_set_dir(PIN_WAIT, GPIO_IN);
     gpio_disable_pulls(PIN_WAIT);
@@ -213,7 +231,6 @@ int main(void) {
     pio_setup();
     dma_setup();
 
-    // Command buffer
     char cmd_buf[32];
     int cmd_len = 0;
     bool tracing = false;
@@ -231,52 +248,40 @@ int main(void) {
         }
 
         if (tracing) {
-            // Check for stop: any incoming byte stops tracing
             if (tud_cdc_available()) {
-                // Drain all incoming bytes
                 uint8_t dummy[64];
                 tud_cdc_read(dummy, sizeof(dummy));
-
                 capture_stop();
                 tracing = false;
-
-                // Flush remaining buffered trace data
                 tud_cdc_write_flush();
                 usb_puts("stopped\r\n");
                 continue;
             }
 
             // Flow control
-            uint32_t rd_pending = ring_available(
-                dma_write_index(dma_chan_read, read_buf), read_buf_tail);
-            uint32_t wr_pending = ring_available(
-                dma_write_index(dma_chan_write, write_buf), write_buf_tail);
-            flow_control_update(rd_pending + wr_pending);
+            uint32_t head = dma_write_index();
+            uint32_t pending = ring_available(head, sample_tail);
+            flow_control_update(pending);
 
-            // Drain read buffer
-            uint32_t rd_head = dma_write_index(dma_chan_read, read_buf);
-            while (read_buf_tail != rd_head) {
-                if (!emit_sample(read_buf[read_buf_tail]))
-                    break;
-                read_buf_tail = (read_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
-            }
+            // Process samples from ring buffer
+            while (sample_tail != head) {
+                uint32_t sample = sample_buf[sample_tail];
+                cycle_type_t ct = process_sample(sample);
 
-            // Drain write buffer
-            uint32_t wr_head = dma_write_index(dma_chan_write, write_buf);
-            while (write_buf_tail != wr_head) {
-                if (!emit_sample(write_buf[write_buf_tail]))
-                    break;
-                write_buf_tail = (write_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+                if (ct != CYCLE_UNKNOWN) {
+                    if (!emit_cycle(ct, sample))
+                        break;  // USB full — back-pressure
+                }
+
+                sample_tail = (sample_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
             }
 
             tud_cdc_write_flush();
 
         } else {
-            // Command mode: read characters, look for commands
             while (tud_cdc_available()) {
                 uint8_t ch;
                 tud_cdc_read(&ch, 1);
-
                 if (ch == '\r' || ch == '\n') {
                     if (cmd_len > 0) {
                         cmd_buf[cmd_len] = '\0';

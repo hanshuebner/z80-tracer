@@ -17,6 +17,7 @@ add_executable(z80_tracer main.c)
 # Generate PIO headers
 pico_generate_pio_header(z80_tracer ${CMAKE_CURRENT_LIST_DIR}/z80_trace.pio)
 
+
 target_include_directories(z80_tracer PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
 target_link_libraries(z80_tracer
@@ -55,3 +56,16 @@ target_link_libraries(test_wait
 pico_enable_stdio_usb(test_wait 1)
 pico_enable_stdio_uart(test_wait 0)
 pico_add_extra_outputs(test_wait)
+
+# --- Test firmware: IRQ/NMI detector ---
+add_executable(test_irq test_irq.c)
+pico_generate_pio_header(test_irq ${CMAKE_CURRENT_LIST_DIR}/z80_trace.pio)
+target_include_directories(test_irq PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_link_libraries(test_irq
+    pico_stdlib
+    hardware_pio
+    hardware_gpio
+)
+pico_enable_stdio_usb(test_irq 1)
+pico_enable_stdio_uart(test_irq 0)
+pico_add_extra_outputs(test_irq)

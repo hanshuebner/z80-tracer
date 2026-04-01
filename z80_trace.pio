@@ -2,7 +2,6 @@
 ;
 ; Pin mapping (configured via C SDK, not hardcoded here):
 ;   in_base  = GPIO 0  (captures GPIO 0-30: addr + data + control)
-;   jmp_pin  = GPIO 29 (/RFSH) - HIGH means not a refresh cycle
 ;
 ; Captured 31-bit word layout:
 ;   [15:0]  = A0-A15
@@ -16,11 +15,26 @@
 ;   [30]    = CLK
 
 ; ============================================================
-; SM0: Read cycle capture (memory reads, IO reads, opcode fetches)
+; z80_bus_sample: Main capture program (used by tracer firmware)
+;
+; Samples all bus signals at each Z80 CLK falling edge.
+; All cycle classification is done in software on the ARM core.
+; This gives perfect temporal ordering from a single FIFO.
+; ============================================================
+.program z80_bus_sample
+
+.wrap_target
+    wait 1 gpio 30          ; wait for CLK high
+    wait 0 gpio 30          ; CLK falling edge — all signals stable
+    in pins, 31             ; capture GPIO 0-30
+    push noblock            ; push to RX FIFO (drop if full)
+.wrap
+
+; ============================================================
+; z80_read_capture: Legacy read cycle capture (used by test firmwares)
 ;
 ; Triggers on /RD falling edge. Skips DRAM refresh cycles by
-; checking /RFSH via jmp_pin. Samples the bus at the next CLK
-; falling edge, which is when the Z80 latches read data.
+; checking /RFSH via jmp_pin. Samples at next CLK falling edge.
 ; ============================================================
 .program z80_read_capture
 
@@ -38,11 +52,9 @@ valid_read:
 .wrap
 
 ; ============================================================
-; SM1: Write cycle capture (memory writes, IO writes)
+; z80_write_capture: Legacy write cycle capture (used by test firmwares)
 ;
-; Triggers on /WR falling edge. No refresh filtering needed
-; because /WR is never active during DRAM refresh. Samples at
-; CLK falling edge when write data is stable.
+; Triggers on /WR falling edge. Samples at CLK falling edge.
 ; ============================================================
 .program z80_write_capture
 
@@ -52,5 +64,24 @@ valid_read:
     wait 1 gpio 30          ; wait for CLK high
     wait 0 gpio 30          ; CLK falling edge = data stable
     in pins, 31             ; capture GPIO 0-30
+    push noblock
+.wrap
+
+; ============================================================
+; z80_intack_capture: Legacy INT acknowledge capture (test firmwares)
+;
+; Triggers on /IORQ falling edge, checks /M1 via jmp_pin.
+; ============================================================
+.program z80_intack_capture
+
+.wrap_target
+wait_iorq:
+    wait 1 gpio 26          ; ensure /IORQ is high (idle)
+    wait 0 gpio 26          ; /IORQ just went low
+    jmp pin wait_iorq        ; jmp_pin = /M1: if HIGH -> normal I/O, skip
+    ; /M1 is LOW and /IORQ is LOW -> INT acknowledge
+    wait 1 gpio 30          ; wait for CLK high
+    wait 0 gpio 30          ; CLK falling edge
+    in pins, 31             ; capture bus state
     push noblock
 .wrap

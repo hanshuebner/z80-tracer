@@ -113,6 +113,9 @@ class InstructionAssembler:
 
     def _on_opcode_fetch(self, addr, value):
         if self._state == "IDLE":
+            if addr == 0x0066:
+                import sys
+                print(f"[DBG] FETCH $0066 while IDLE (missed NMI detection!)", file=sys.stderr)
             return self._start_new(addr, value)
 
         if self._state == "WAIT_IX_OPCODE":
@@ -167,6 +170,8 @@ class InstructionAssembler:
         # instruction shouldn't branch there, the last 2 data_writes are
         # the NMI's stack push — strip them from the instruction.
         if addr == 0x0066:
+            import sys
+            print(f"[DBG] NMI detected: state={self._state} pc=${self._pc:04X} -> $0066, {len(self._data_writes)} writes", file=sys.stderr)
             if len(self._data_writes) >= 2:
                 self._data_writes = self._data_writes[:-2]
             self.nmi_detected = True
