@@ -146,11 +146,13 @@ static void emit_sample(uint32_t sample) {
     cycle_type_t ct = classify_sample(sample);
     if (ct == CYCLE_UNKNOWN) return;
 
+    uint16_t addr = sample_addr(sample);
+    uint8_t data = sample_data(sample);
     uint8_t pkt[USB_PACKET_SIZE];
-    pkt[0] = (uint8_t)ct;
-    pkt[1] = sample_addr(sample) & 0xFF;
-    pkt[2] = sample_addr(sample) >> 8;
-    pkt[3] = sample_data(sample);
+    pkt[0] = 0x80 | ((uint8_t)ct << 3) | ((addr >> 13) & 0x07);
+    pkt[1] = (addr >> 6) & 0x7F;
+    pkt[2] = ((addr & 0x3F) << 1) | ((data >> 7) & 0x01);
+    pkt[3] = data & 0x7F;
 
     for (int i = 0; i < USB_PACKET_SIZE; i++) {
         putchar_raw(pkt[i]);

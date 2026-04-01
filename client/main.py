@@ -35,10 +35,14 @@ PACKET_SIZE = 4
 
 
 def parse_packet(data):
-    """Parse a 4-byte trace packet.  Returns (cycle_type, addr, value)."""
-    cycle_type = data[0]
-    addr = data[1] | (data[2] << 8)
-    value = data[3]
+    """Parse a 4-byte trace packet with bit-7 sync framing.
+
+    Format: 1TTTT_AAA 0AAAAAAA 0AAAAAAD 0DDDDDDD
+    Returns (cycle_type, addr, value).
+    """
+    cycle_type = (data[0] >> 3) & 0x0F
+    addr = ((data[0] & 0x07) << 13) | (data[1] << 6) | (data[2] >> 1)
+    value = ((data[2] & 0x01) << 7) | data[3]
     return cycle_type, addr, value
 
 
@@ -275,6 +279,10 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False):
                 continue
 
             buf.extend(chunk)
+
+            # Sync: skip bytes until we find one with bit 7 set (packet start)
+            while buf and not (buf[0] & 0x80):
+                buf = buf[1:]
 
             while len(buf) >= PACKET_SIZE:
                 pkt = buf[:PACKET_SIZE]

@@ -30,10 +30,10 @@ class Z80BusGen:
         self.sp = 0  # track SP for push/pop/call/ret generation
 
     def _pkt(self, cycle_type, addr, data):
-        self.packets.append(cycle_type)
-        self.packets.append(addr & 0xFF)
-        self.packets.append((addr >> 8) & 0xFF)
-        self.packets.append(data & 0xFF)
+        self.packets.append(0x80 | ((cycle_type & 0x0F) << 3) | ((addr >> 13) & 0x07))
+        self.packets.append((addr >> 6) & 0x7F)
+        self.packets.append(((addr & 0x3F) << 1) | ((data >> 7) & 0x01))
+        self.packets.append(data & 0x7F)
 
     def fetch(self, opcode, addr=None):
         """Opcode fetch (M1 cycle)."""

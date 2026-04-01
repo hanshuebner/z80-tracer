@@ -98,10 +98,12 @@ static inline uint8_t sample_data(uint32_t sample) {
 #define CAPTURE_BUF_SIZE_WORDS  (32 * 1024)  // 32K entries = 128KB
 #define CAPTURE_BUF_SIZE_BYTES  (CAPTURE_BUF_SIZE_WORDS * sizeof(uint32_t))
 
-// USB CDC output packet format (binary):
-//   Byte 0:    cycle type (cycle_type_t)
-//   Byte 1-2:  address (little-endian)
-//   Byte 3:    data
+// USB CDC output packet format (binary, 4 bytes with bit-7 sync):
+//   Byte 0:  1TTTT_AAA   bit7=1 (sync), bits 6-3 = cycle_type, bits 2-0 = addr[15:13]
+//   Byte 1:  0AAA_AAAA   bit7=0, bits 6-0 = addr[12:6]
+//   Byte 2:  0AAA_AAAD   bit7=0, bits 6-1 = addr[5:0], bit 0 = data[7]
+//   Byte 3:  0DDD_DDDD   bit7=0, bits 6-0 = data[6:0]
+// Only byte 0 has bit 7 set — scan for it to resync after connecting mid-stream.
 #define USB_PACKET_SIZE 4
 
 // Flow control thresholds (in ring buffer entries)
