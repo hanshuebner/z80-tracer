@@ -47,7 +47,7 @@ Row B │ GP2    GND    GP0    3V3    ADC_VRF SWCLK  SWDIO  GP47    GND    GP45
       │
 Row C │ GP4    GP3    ---    ---    ---    ---    ---    ---    GP43   GP44
       │
-Row D │ GP6    GP5    ---    ---    ---    ---    ---    ---    GP42   GP41
+Row D │ GP6    GP5    ---    ---    ---    ---    ---    ---    GP41   GP42
       │
 Row E │ GP8    GP7    ---    ---    ---    ---    ---    ---    GP39   GP40
       │
@@ -57,9 +57,9 @@ Row G │ GP12   GP11   ---    ---    ---    ---    ---    ---    GP35   GP36
       │
 Row H │ GP14   GP13   ---    ---    ---    ---    ---    ---    GP33   GP34
       │
-Row I │ GP16   GP15   GP20   GP21   GP22   GP25   GP27   GP28   GP31   GP32
+Row I │ GP16   GP15   GP20   GP21   GP23   GP25   GP27   GP29   GP31   GP32
       │
-Row J │ GND    GP17   GP18   GP19   GP23   GP24   GP26   GP29   GP30    GND
+Row J │ GND    GP17   GP18   GP19   GP22   GP24   GP26   GP28   GP30    GND
 ```
 
 Note: "---" = no pin (interior is empty, chip sits there). "BOOTSL" = BOOTSEL.
@@ -74,14 +74,14 @@ GPIO  Grid     GPIO  Grid     GPIO  Grid     GPIO  Grid
  1    A2        13   H2        25   I6        37   F9
  2    B1        14   H1        26   J7        38   F10
  3    C2        15   I2        27   I7        39   E9
- 4    C1        16   I1        28   I8        40   E10
- 5    D2        17   J2        29   J8        41   D10
- 6    D1        18   J3        30   J9        42   D9
+ 4    C1        16   I1        28   J8        40   E10
+ 5    D2        17   J2        29   I8        41   D9
+ 6    D1        18   J3        30   J9        42   D10
  7    E2        19   J4        31   I9        43   C9
  8    E1        20   I3        32   I10       44   C10
  9    F2        21   I4        33   H9        45   B10
-10    F1        22   I5        34   H10       46   A9
-11    G2        23   J5        35   G9        47   B8
+10    F1        22   J5        34   H10       46   A9
+11    G2        23   I5        35   G9        47   B8
 ```
 
 ## Z80 DIP-40 Pinout
@@ -132,9 +132,9 @@ The table below is sorted by Z80 pin number for reference.
   7   D4        GP20    I3     Row I, 3rd from left
   8   D3        GP19    J4     Row J, 4th from left
   9   D5        GP21    I4     Row I, 4th from left
- 10   D6        GP22    I5     Row I, 5th from left
+ 10   D6        GP22    J5     Row J, 5th from left
  12   D2        GP18    J3     Row J, 3rd from left
- 13   D7        GP23    J5     Row J, 5th from left
+ 13   D7        GP23    I5     Row I, 5th from left
  14   D0        GP16    I1     Row I, leftmost
  15   D1        GP17    J2     Row J, 2nd from left
  16   /INT      GP33    H9     Row H, 9th from left
@@ -143,11 +143,11 @@ The table below is sorted by Z80 pin number for reference.
  19   /MREQ     GP25    I6     Row I, 6th from left
  20   /IORQ     GP26    J7     Row J, 7th from left
  21   /RD       GP27    I7     Row I, 7th from left
- 22   /WR       GP28    I8     Row I, 8th from left
+ 22   /WR       GP28    J8     Row J, 8th from left
  24   /WAIT     GP32    I10    Row I, rightmost
  26   /RESET    GP35    G9     Row G, 9th from left
  27   /M1       GP24    J6     Row J, 6th from left
- 28   /RFSH     GP29    J8     Row J, 8th from left
+ 28   /RFSH     GP29    I8     Row I, 8th from left
  29   GND       GND     A1     Row A, leftmost (any of the 6 GND pins will do)
  30   A0        GP0     B3     Row B, 3rd from left
  31   A1        GP1     A2     Row A, 2nd from left

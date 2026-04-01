@@ -32,3 +32,16 @@ pico_enable_stdio_usb(z80_tracer 1)
 pico_enable_stdio_uart(z80_tracer 0)
 
 pico_add_extra_outputs(z80_tracer)
+
+# --- Test firmware: raw console output ---
+add_executable(test_raw test_raw.c)
+pico_generate_pio_header(test_raw ${CMAKE_CURRENT_LIST_DIR}/z80_trace.pio)
+target_include_directories(test_raw PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_link_libraries(test_raw
+    pico_stdlib
+    hardware_pio
+    hardware_gpio
+)
+pico_enable_stdio_usb(test_raw 1)
+pico_enable_stdio_uart(test_raw 0)
+pico_add_extra_outputs(test_raw)

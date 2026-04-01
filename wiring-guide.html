@@ -55,17 +55,17 @@ const PGA_PINS = [
   [1,1,"GP2"],[1,2,"GND"],[1,3,"GP0"],[1,4,"3V3"],[1,5,"ADC_VRF"],
   [1,6,"SWCLK"],[1,7,"SWDIO"],[1,8,"GP47"],[1,9,"GND"],[1,10,"GP45"],
   [2,1,"GP4"],[2,2,"GP3"],   [2,9,"GP43"],[2,10,"GP44"],
-  [3,1,"GP6"],[3,2,"GP5"],   [3,9,"GP42"],[3,10,"GP41"],
+  [3,1,"GP6"],[3,2,"GP5"],   [3,9,"GP41"],[3,10,"GP42"],
   [4,1,"GP8"],[4,2,"GP7"],   [4,9,"GP39"],[4,10,"GP40"],
   [5,1,"GP10"],[5,2,"GP9"],  [5,9,"GP37"],[5,10,"GP38"],
   [6,1,"GP12"],[6,2,"GP11"], [6,9,"GP35"],[6,10,"GP36"],
   [7,1,"GP14"],[7,2,"GP13"], [7,9,"GP33"],[7,10,"GP34"],
   [8,1,"GP16"],[8,2,"GP15"],[8,3,"GP20"],[8,4,"GP21"],
-  [8,5,"GP22"],[8,6,"GP25"],[8,7,"GP27"],[8,8,"GP28"],
+  [8,5,"GP23"],[8,6,"GP25"],[8,7,"GP27"],[8,8,"GP29"],
   [8,9,"GP31"],[8,10,"GP32"],
   // Row J — J1, J10 are GND
-  [9,1,"GND"],[9,2,"GP17"],[9,3,"GP18"],[9,4,"GP19"],[9,5,"GP23"],
-  [9,6,"GP24"],[9,7,"GP26"],[9,8,"GP29"],[9,9,"GP30"],[9,10,"GND"],
+  [9,1,"GND"],[9,2,"GP17"],[9,3,"GP18"],[9,4,"GP19"],[9,5,"GP22"],
+  [9,6,"GP24"],[9,7,"GP26"],[9,8,"GP28"],[9,9,"GP30"],[9,10,"GND"],
 ];
 
 // ===== LAYOUT =====
@@ -146,14 +146,14 @@ const WIRE_DB = {
    8:{signal:"D3",  gpio:"GP19", row:9,col:4,  group:"data"},
    7:{signal:"D4",  gpio:"GP20", row:8,col:3,  group:"data"},
    9:{signal:"D5",  gpio:"GP21", row:8,col:4,  group:"data"},
-  10:{signal:"D6",  gpio:"GP22", row:8,col:5,  group:"data"},
-  13:{signal:"D7",  gpio:"GP23", row:9,col:5,  group:"data"},
+  10:{signal:"D6",  gpio:"GP22", row:9,col:5,  group:"data"},
+  13:{signal:"D7",  gpio:"GP23", row:8,col:5,  group:"data"},
   27:{signal:"/M1",   gpio:"GP24", row:9,col:6,  group:"ctrl"},
   19:{signal:"/MREQ", gpio:"GP25", row:8,col:6,  group:"ctrl"},
   20:{signal:"/IORQ", gpio:"GP26", row:9,col:7,  group:"ctrl"},
   21:{signal:"/RD",   gpio:"GP27", row:8,col:7,  group:"ctrl"},
-  22:{signal:"/WR",   gpio:"GP28", row:8,col:8,  group:"ctrl"},
-  28:{signal:"/RFSH", gpio:"GP29", row:9,col:8,  group:"ctrl"},
+  22:{signal:"/WR",   gpio:"GP28", row:9,col:8,  group:"ctrl"},
+  28:{signal:"/RFSH", gpio:"GP29", row:8,col:8,  group:"ctrl"},
    6:{signal:"CLK",   gpio:"GP30", row:9,col:9,  group:"ctrl"},
   18:{signal:"/HALT", gpio:"GP31", row:8,col:9,  group:"ctrl"},
   24:{signal:"/WAIT", gpio:"GP32", row:8,col:10, group:"ctrl"},
@@ -357,6 +357,22 @@ function initSVG() {
   svg.appendChild(svgEl("g", { id:"wires" }));
   svg.appendChild(svgEl("g", { id:"hilite" }));
 
+  // Hit-target layer (transparent larger circles above everything for hover)
+  const hitG = svgEl("g", { id:"hit-targets" });
+  for (let pin = 1; pin <= 40; pin++) {
+    const { x, y } = z80XY(pin);
+    hitG.appendChild(svgEl("circle", { cx:x, cy:y, r:10, fill:"transparent", id:`z80-hit-${pin}`, cursor:"pointer" }));
+  }
+  for (const [row, col] of PGA_PINS) {
+    const { x, y } = pgaXY(row, col);
+    hitG.appendChild(svgEl("circle", { cx:x, cy:y, r:10, fill:"transparent", id:`pga-hit-${row}-${col}`, cursor:"pointer" }));
+  }
+  for (const { idx } of USB_PINS) {
+    const { x, y } = usbPinXY(idx);
+    hitG.appendChild(svgEl("circle", { cx:x, cy:y, r:10, fill:"transparent", id:`usb-hit-${idx}`, cursor:"pointer" }));
+  }
+  svg.appendChild(hitG);
+
   // Legend
   const ly = 720;
   [["Address","#60a5fa"],["Data","#34d399"],["Control","#fb923c"],
@@ -463,7 +479,91 @@ document.addEventListener("keydown", e => {
   else if (e.key === "End") { e.preventDefault(); currentIndex = TOTAL - 1; renderWires(); }
 });
 
+// ===== TOOLTIP =====
+const tipG = svgEl("g", { id:"tooltip", visibility:"hidden", "pointer-events":"none" });
+const tipRect = svgEl("rect", { rx:4, fill:"#16213e", stroke:"#666", "stroke-width":1, opacity:0.95 });
+const tipLine1 = svgEl("text", { "font-family":"monospace", "font-size":12, fill:"#fff", "font-weight":"bold", "dominant-baseline":"central" });
+const tipLine2 = svgEl("text", { "font-family":"monospace", "font-size":11, fill:"#aaa", "dominant-baseline":"central" });
+tipG.appendChild(tipRect);
+tipG.appendChild(tipLine1);
+tipG.appendChild(tipLine2);
+
+// Build reverse lookup: "row,col" -> wire info
+const pgaWireLookup = {};
+for (const [z80pin, info] of Object.entries(WIRE_DB)) {
+  pgaWireLookup[`${info.row},${info.col}`] = { z80pin: Number(z80pin), signal: info.signal, gpio: info.gpio };
+}
+
+function showTooltip(evt, line1, line2) {
+  const pt = svg.createSVGPoint();
+  pt.x = evt.clientX; pt.y = evt.clientY;
+  const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+  const tx = svgPt.x + 12, ty = svgPt.y - 10;
+
+  tipLine1.textContent = line1;
+  tipLine2.textContent = line2 || "";
+  // Measure text width
+  tipG.setAttribute("visibility", "visible");
+  const w1 = tipLine1.getComputedTextLength();
+  const w2 = tipLine2.getComputedTextLength();
+  const boxW = Math.max(w1, w2) + 16;
+  const boxH = line2 ? 40 : 24;
+
+  // Flip left if near right edge
+  const finalX = (tx + boxW > 1180) ? svgPt.x - boxW - 8 : tx;
+  const finalY = (ty - boxH < 25) ? svgPt.y + 14 : ty - boxH;
+
+  tipRect.setAttribute("x", finalX); tipRect.setAttribute("y", finalY);
+  tipRect.setAttribute("width", boxW); tipRect.setAttribute("height", boxH);
+  tipLine1.setAttribute("x", finalX + 8); tipLine1.setAttribute("y", finalY + (line2 ? 13 : 12));
+  tipLine2.setAttribute("x", finalX + 8); tipLine2.setAttribute("y", finalY + 29);
+}
+
+function hideTooltip() { tipG.setAttribute("visibility", "hidden"); }
+
+function attachTooltips() {
+  function bind(el, enterFn) {
+    el.addEventListener("mouseenter", enterFn);
+    el.addEventListener("mousemove", enterFn);
+    el.addEventListener("mouseleave", hideTooltip);
+  }
+
+  // Z80 pins
+  for (let pin = 1; pin <= 40; pin++) {
+    const el = document.getElementById(`z80-hit-${pin}`);
+    if (!el) continue;
+    bind(el, evt => {
+      const sig = Z80_SIGNALS[pin];
+      const wire = WIRE_DB[pin];
+      const l2 = wire ? `\u2192 ${wire.gpio} (PGA ${PGA_ROW_LABELS[wire.row]}${wire.col})`
+        : [11,23,25].includes(pin) ? "not connected" : "";
+      showTooltip(evt, `Pin ${pin}: ${sig}`, l2);
+    });
+  }
+
+  // PGA pins
+  for (const [row, col, label] of PGA_PINS) {
+    const el = document.getElementById(`pga-hit-${row}-${col}`);
+    if (!el) continue;
+    bind(el, evt => {
+      const gridName = `${PGA_ROW_LABELS[row]}${col}`;
+      const wire = pgaWireLookup[`${row},${col}`];
+      const l2 = wire ? `Z80 pin ${wire.z80pin}: ${wire.signal}` : "";
+      showTooltip(evt, `${gridName}: ${label}`, l2);
+    });
+  }
+
+  // USB pins
+  for (const { label, idx } of USB_PINS) {
+    const el = document.getElementById(`usb-hit-${idx}`);
+    if (!el) continue;
+    bind(el, evt => showTooltip(evt, `USB-C: ${label}`, ""));
+  }
+}
+
 initSVG();
+svg.appendChild(tipG);  // tooltip on top of everything
+attachTooltips();
 renderWires();
 </script>
 </body>
