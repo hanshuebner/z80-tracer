@@ -103,67 +103,70 @@ static void flow_control_update(uint32_t pending) {
 // data one CLK cycle after the trigger (when data is valid).
 
 static uint32_t prev_sample = 0xFFFFFFFF;  // all signals inactive
-static bool rd_pending = false;
-static bool wr_pending = false;
-static bool intack_pending = false;
 
-// Returns cycle type or CYCLE_UNKNOWN if this sample isn't a bus cycle
+// Track active bus cycles waiting for full signal setup
+static bool rd_active = false;   // /RD is low, waiting to classify
+static bool wr_active = false;   // /WR is low, waiting to classify
+static bool intack_active = false;
+
+// Classifies bus cycles from CLK-edge samples.
+//
+// On Z80, /RD and /WR may go active before /MREQ settles (signal
+// skew at CLK↓). So we track "in a read/write cycle" and classify
+// on the first sample where ALL required signals are present.
+// Each bus cycle is emitted exactly once.
 static cycle_type_t process_sample(uint32_t sample) {
-    cycle_type_t result = CYCLE_UNKNOWN;
-
-    // Delayed captures: emit the bus cycle one CLK after trigger
-    if (intack_pending) {
-        intack_pending = false;
-        int m1   = !(sample & SAMPLE_M1_BIT);
-        int iorq = !(sample & SAMPLE_IORQ_BIT);
-        if (m1 && iorq) result = CYCLE_INT_ACK;
-    } else if (rd_pending) {
-        rd_pending = false;
-        int m1   = !(sample & SAMPLE_M1_BIT);
-        int mreq = !(sample & SAMPLE_MREQ_BIT);
-        int iorq = !(sample & SAMPLE_IORQ_BIT);
-        int rd   = !(sample & SAMPLE_RD_BIT);
-        if (rd) {  // /RD still active
-            if (m1 && mreq)      result = CYCLE_OPCODE_FETCH;
-            else if (mreq)       result = CYCLE_MEM_READ;
-            else if (iorq)       result = CYCLE_IO_READ;
-        }
-    } else if (wr_pending) {
-        wr_pending = false;
-        int mreq = !(sample & SAMPLE_MREQ_BIT);
-        int iorq = !(sample & SAMPLE_IORQ_BIT);
-        int wr   = !(sample & SAMPLE_WR_BIT);
-        if (wr) {
-            if (mreq)            result = CYCLE_MEM_WRITE;
-            else if (iorq)       result = CYCLE_IO_WRITE;
-        }
-    }
-
-    // Detect falling edges (active-low: bit goes from 1 to 0)
-    uint32_t fell = prev_sample & ~sample;
-
-    // INT acknowledge: /IORQ falls while /M1 is already active
-    if ((fell & SAMPLE_IORQ_BIT) && !(sample & SAMPLE_M1_BIT)) {
-        intack_pending = true;
-    }
-    // /RD falling edge (skip if /RFSH is active = refresh cycle)
-    else if ((fell & SAMPLE_RD_BIT) && (sample & SAMPLE_RFSH_BIT)) {
-        rd_pending = true;
-    }
-    // /WR falling edge
-    else if (fell & SAMPLE_WR_BIT) {
-        wr_pending = true;
-    }
-
+    uint32_t fell = prev_sample & ~sample;  // bits that went 1→0
     prev_sample = sample;
-    return result;
+
+    int m1   = !(sample & SAMPLE_M1_BIT);
+    int mreq = !(sample & SAMPLE_MREQ_BIT);
+    int iorq = !(sample & SAMPLE_IORQ_BIT);
+    int rd   = !(sample & SAMPLE_RD_BIT);
+    int wr   = !(sample & SAMPLE_WR_BIT);
+    int rfsh = !(sample & SAMPLE_RFSH_BIT);
+
+    // Reset tracking when signals go inactive
+    if (!rd)   rd_active = false;
+    if (!wr)   wr_active = false;
+    if (!iorq || !m1) intack_active = false;
+
+    // INT acknowledge: /IORQ active with /M1 active, not yet classified
+    if (m1 && iorq && !intack_active) {
+        intack_active = true;
+        return CYCLE_INT_ACK;
+    }
+
+    // Read cycle: /RD active, classify when /MREQ or /IORQ also active
+    // Suppress during INT acknowledge (intack_active) to avoid
+    // misclassifying the ack's /RD as an OPCODE_FETCH.
+    if (rd && !rd_active && !rfsh && !intack_active) {
+        if (mreq || iorq) {
+            rd_active = true;  // classified — don't repeat
+            if (m1 && mreq)  return CYCLE_OPCODE_FETCH;
+            if (mreq)        return CYCLE_MEM_READ;
+            if (iorq)        return CYCLE_IO_READ;
+        }
+        // /RD active but /MREQ and /IORQ not yet — will retry next sample
+    }
+
+    // Write cycle: /WR active, classify when /MREQ or /IORQ also active
+    if (wr && !wr_active && !intack_active) {
+        if (mreq || iorq) {
+            wr_active = true;
+            if (mreq)        return CYCLE_MEM_WRITE;
+            if (iorq)        return CYCLE_IO_WRITE;
+        }
+    }
+
+    return CYCLE_UNKNOWN;
 }
 
 static void reset_classifier(void) {
     prev_sample = 0xFFFFFFFF;
-    rd_pending = false;
-    wr_pending = false;
-    intack_pending = false;
+    rd_active = false;
+    wr_active = false;
+    intack_active = false;
 }
 
 // ---- USB output ----
