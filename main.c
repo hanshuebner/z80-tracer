@@ -1,11 +1,26 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "hardware/pio.h"
+#include "hardware/dma.h"
 #include "hardware/gpio.h"
 
 #include "z80_trace.h"
 #include "z80_trace.pio.h"
+
+// Ring buffer shared between DMA (writer) and core 1 (reader)
+static uint32_t __attribute__((aligned(CAPTURE_BUF_SIZE_BYTES)))
+    read_buf[CAPTURE_BUF_SIZE_WORDS];
+static uint32_t __attribute__((aligned(CAPTURE_BUF_SIZE_BYTES)))
+    write_buf[CAPTURE_BUF_SIZE_WORDS];
+
+// Software read pointers (DMA write pointer is inferred from DMA read address)
+static volatile uint32_t read_buf_tail = 0;
+static volatile uint32_t write_buf_tail = 0;
+
+// Flow control state
+static volatile bool wait_asserted = false;
 
 // ---- GPIO setup ----
 
@@ -64,9 +79,68 @@ static void pio_setup(void) {
     pio_sm_init(pio, sm_write, offset_wr, &cfg_wr);
 }
 
-// ---- USB output ----
-// Binary protocol: 4-byte packets with bit-7 sync framing.
-// Sent via putchar_raw() which bypasses newline translation.
+// ---- DMA setup ----
+// Uses ring-mode DMA: write address wraps within the buffer automatically.
+
+static int dma_chan_read;
+static int dma_chan_write;
+
+static void dma_setup(void) {
+    // DMA channel for read captures (PIO SM RX FIFO -> read_buf)
+    dma_chan_read = dma_claim_unused_channel(true);
+    dma_channel_config c_rd = dma_channel_get_default_config(dma_chan_read);
+    channel_config_set_transfer_data_size(&c_rd, DMA_SIZE_32);
+    channel_config_set_read_increment(&c_rd, false);   // read from fixed FIFO addr
+    channel_config_set_write_increment(&c_rd, true);    // write pointer advances
+    channel_config_set_ring(&c_rd, true, CAPTURE_BUF_RING_BITS);
+    channel_config_set_dreq(&c_rd, pio_get_dreq(pio, sm_read, false));
+    dma_channel_configure(dma_chan_read, &c_rd,
+        read_buf,                               // write address
+        &pio->rxf[sm_read],                     // read address (PIO RX FIFO)
+        0xFFFFFFFF,                             // transfer count (run forever)
+        false);                                 // don't start yet
+
+    // DMA channel for write captures
+    dma_chan_write = dma_claim_unused_channel(true);
+    dma_channel_config c_wr = dma_channel_get_default_config(dma_chan_write);
+    channel_config_set_transfer_data_size(&c_wr, DMA_SIZE_32);
+    channel_config_set_read_increment(&c_wr, false);
+    channel_config_set_write_increment(&c_wr, true);
+    channel_config_set_ring(&c_wr, true, CAPTURE_BUF_RING_BITS);
+    channel_config_set_dreq(&c_wr, pio_get_dreq(pio, sm_write, false));
+    dma_channel_configure(dma_chan_write, &c_wr,
+        write_buf,
+        &pio->rxf[sm_write],
+        0xFFFFFFFF,
+        false);
+}
+
+// Get DMA write pointer as an index into the ring buffer
+static inline uint32_t dma_write_index(int chan, uint32_t *buf) {
+    uint32_t write_addr = dma_channel_hw_addr(chan)->write_addr;
+    return (write_addr - (uint32_t)(uintptr_t)buf) / sizeof(uint32_t);
+}
+
+// Number of entries available to read in a ring buffer
+static inline uint32_t ring_available(uint32_t head, uint32_t tail) {
+    return (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
+}
+
+// ---- Flow control ----
+
+static void flow_control_update(uint32_t total_pending) {
+    if (!wait_asserted && total_pending >= FLOW_CTRL_ASSERT_THRESHOLD) {
+        gpio_put(PIN_WAIT, 0);  // assert /WAIT - pause Z80
+        wait_asserted = true;
+    } else if (wait_asserted && total_pending <= FLOW_CTRL_RELEASE_THRESHOLD) {
+        gpio_put(PIN_WAIT, 1);  // release /WAIT - resume Z80
+        wait_asserted = false;
+    }
+}
+
+// ---- USB output (runs on core 1) ----
+// Uses pico-sdk stdio_usb (CDC).  Output is raw binary: 4-byte packets
+// sent via putchar_raw() which bypasses newline translation.
 
 static void emit_sample(uint32_t sample) {
     cycle_type_t ct = classify_sample(sample);
@@ -85,6 +159,32 @@ static void emit_sample(uint32_t sample) {
     }
 }
 
+static void core1_main(void) {
+    while (true) {
+        // Drain read capture buffer
+        uint32_t rd_head = dma_write_index(dma_chan_read, read_buf);
+        while (read_buf_tail != rd_head) {
+            emit_sample(read_buf[read_buf_tail]);
+            read_buf_tail = (read_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+        }
+
+        // Drain write capture buffer
+        uint32_t wr_head = dma_write_index(dma_chan_write, write_buf);
+        while (write_buf_tail != wr_head) {
+            emit_sample(write_buf[write_buf_tail]);
+            write_buf_tail = (write_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+        }
+
+        // Flush USB
+        stdio_flush();
+
+        // Update flow control based on total pending data
+        uint32_t total_pending = ring_available(rd_head, read_buf_tail)
+                               + ring_available(wr_head, write_buf_tail);
+        flow_control_update(total_pending);
+    }
+}
+
 // ---- Entry point ----
 
 int main(void) {
@@ -96,19 +196,21 @@ int main(void) {
 
     gpio_setup();
     pio_setup();
+    dma_setup();
+
+    // Start DMA channels
+    dma_channel_start(dma_chan_read);
+    dma_channel_start(dma_chan_write);
 
     // Start PIO state machines
     pio_sm_set_enabled(pio, sm_read, true);
     pio_sm_set_enabled(pio, sm_write, true);
 
-    // Main loop: poll PIO FIFOs directly and emit binary packets
+    // Start core 1 (USB drain loop)
+    multicore_launch_core1(core1_main);
+
+    // Core 0: idle (stdio_usb services USB in the background)
     while (true) {
-        while (!pio_sm_is_rx_fifo_empty(pio, sm_read))
-            emit_sample(pio_sm_get(pio, sm_read));
-
-        while (!pio_sm_is_rx_fifo_empty(pio, sm_write))
-            emit_sample(pio_sm_get(pio, sm_write));
-
-        stdio_flush();
+        tight_loop_contents();
     }
 }
