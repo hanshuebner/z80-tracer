@@ -461,6 +461,8 @@ def _add_prefix_len(mnem, length, effect):
 
 def _decode_ixcb(opcode, disp, idx_reg):
     """Decode DD CB d opcode / FD CB d opcode instructions."""
+    if disp is None:
+        return f"??? (IXCB, missing displacement)", 4, ("unknown",)
     x = (opcode >> 6) & 3
     y = (opcode >> 3) & 7
     z = opcode & 7
