@@ -9,6 +9,7 @@ from client.main import (InstructionAssembler, format_instruction,
                          CYCLE_OPCODE_FETCH, CYCLE_MEM_READ, CYCLE_MEM_WRITE)
 from client.z80_state import Z80State
 from client.z80_loop import LoopDetector
+from client.trace_filter import TraceFilter, FilterConfig
 
 
 class TraceHarness:
@@ -165,9 +166,169 @@ def test_infinite_loop():
     print("\nInfinite loop test passed!")
 
 
+class FilterHarness:
+    """Test harness for trace filtering."""
+
+    def __init__(self, config):
+        self.asm = InstructionAssembler()
+        self.state = Z80State()
+        self.filt = TraceFilter(config, format_instruction)
+        self.output_lines = []
+        self.stopped = False
+
+    def feed(self, cycle_type, addr, value):
+        instr = self.asm.feed(cycle_type, addr, value)
+        if instr and not self.stopped:
+            self._process(instr)
+
+    def flush(self):
+        instr = self.asm.flush()
+        if instr and not self.stopped:
+            self._process(instr)
+
+    def _process(self, instr):
+        prev = self.state.snapshot_key()
+        self.state.execute(instr)
+        reg_changes = self.state.format_changed(prev)
+        result = self.filt.evaluate(instr, reg_changes, "normal")
+        self.output_lines.extend(result.lines)
+        if result.stop:
+            self.stopped = True
+
+
+def test_address_mask():
+    """Test that instructions in masked ranges are suppressed."""
+    cfg = FilterConfig(address_masks=[(0x0003, 0x0006)])
+    h = FilterHarness(cfg)
+
+    # NOPs at 0x0000-0x0009
+    for addr in range(10):
+        h.feed(CYCLE_OPCODE_FETCH, addr, 0x00)
+    h.flush()
+
+    # Should see 0000-0002 and 0007-0008, with a mask summary between
+    output = "\n".join(h.output_lines)
+    assert "0000:" in output, "Should show 0x0000"
+    assert "0002:" in output, "Should show 0x0002"
+    assert "0007:" in output, "Should show 0x0007"
+    assert "masked" in output, "Should show mask summary"
+    assert "0003:" not in output, "Should NOT show 0x0003"
+    assert "0005:" not in output, "Should NOT show 0x0005"
+    print("Address mask test passed!")
+
+
+def test_start_at():
+    """Test --start-at trigger."""
+    cfg = FilterConfig(start_at=0x0005)
+    h = FilterHarness(cfg)
+
+    for addr in range(10):
+        h.feed(CYCLE_OPCODE_FETCH, addr, 0x00)
+    h.flush()
+
+    output = "\n".join(h.output_lines)
+    assert "TRIGGER" in output, "Should show trigger event"
+    assert "0005:" in output, "Should show 0x0005"
+    assert "0007:" in output, "Should show 0x0007"
+    assert "0002:" not in output, "Should NOT show 0x0002"
+    print("Start-at trigger test passed!")
+
+
+def test_start_at_with_window():
+    """Test --start-at with --window for pre-trigger context."""
+    cfg = FilterConfig(start_at=0x0005, window_size=3)
+    h = FilterHarness(cfg)
+
+    for addr in range(10):
+        h.feed(CYCLE_OPCODE_FETCH, addr, 0x00)
+    h.flush()
+
+    output = "\n".join(h.output_lines)
+    assert "pre-trigger" in output, "Should show pre-trigger header"
+    assert "0003:" in output, "Window should include 0x0003"
+    assert "0004:" in output, "Window should include 0x0004"
+    assert "0001:" not in output, "Window should NOT reach back to 0x0001"
+    assert "TRIGGER" in output
+    assert "0005:" in output
+    print("Start-at with window test passed!")
+
+
+def test_limit():
+    """Test --limit stops after N printed instructions."""
+    cfg = FilterConfig(limit=5)
+    h = FilterHarness(cfg)
+
+    for addr in range(20):
+        h.feed(CYCLE_OPCODE_FETCH, addr, 0x00)
+    h.flush()
+
+    output = "\n".join(h.output_lines)
+    assert "LIMIT" in output, "Should show limit message"
+    # Count instruction lines (format: XXXX: ...)
+    instr_lines = [l for l in h.output_lines if l and l[0] != ';' and ':' in l[:6]]
+    assert len(instr_lines) == 5, f"Should print exactly 5 instructions, got {len(instr_lines)}"
+    print("Limit test passed!")
+
+
+def test_mem_write_trigger():
+    """Test --trigger-mem-write fires on observed memory write."""
+    cfg = FilterConfig(mem_write_triggers=[(0x4000, None)])
+    h = FilterHarness(cfg)
+
+    # LD SP, FFFF (not a trigger)
+    h.feed(CYCLE_OPCODE_FETCH, 0x0000, 0x31)
+    h.feed(CYCLE_MEM_READ, 0x0001, 0xFF)
+    h.feed(CYCLE_MEM_READ, 0x0002, 0xFF)
+
+    # LD HL, 4000
+    h.feed(CYCLE_OPCODE_FETCH, 0x0003, 0x21)
+    h.feed(CYCLE_MEM_READ, 0x0004, 0x00)
+    h.feed(CYCLE_MEM_READ, 0x0005, 0x40)
+
+    # LD (HL), A — writes to 0x4000 → trigger!
+    h.feed(CYCLE_OPCODE_FETCH, 0x0006, 0x77)
+    h.feed(CYCLE_MEM_WRITE, 0x4000, 0x00)
+
+    # NOP after trigger
+    h.feed(CYCLE_OPCODE_FETCH, 0x0007, 0x00)
+    h.flush()
+
+    output = "\n".join(h.output_lines)
+    assert "TRIGGER" in output, "Should fire trigger"
+    assert "mem write" in output, "Should mention mem write"
+    assert "0000:" not in output, "Should NOT show pre-trigger LD SP"
+    print("Memory write trigger test passed!")
+
+
+def test_stop_on():
+    """Test --stop-on mnemonic pattern."""
+    cfg = FilterConfig(stop_on="HALT")
+    h = FilterHarness(cfg)
+
+    # NOPs then HALT
+    for addr in range(5):
+        h.feed(CYCLE_OPCODE_FETCH, addr, 0x00)
+    h.feed(CYCLE_OPCODE_FETCH, 0x0005, 0x76)  # HALT
+    h.feed(CYCLE_OPCODE_FETCH, 0x0006, 0x00)
+    h.flush()
+
+    output = "\n".join(h.output_lines)
+    assert "STOP" in output, "Should show stop event"
+    assert "0003:" in output, "Should show instructions before HALT"
+    assert "0006:" not in output, "Should NOT show instructions after HALT"
+    print("Stop-on mnemonic test passed!")
+
+
 if __name__ == "__main__":
     test_basic_program()
     print()
     test_prefixed()
     print()
     test_infinite_loop()
+    print()
+    test_address_mask()
+    test_start_at()
+    test_start_at_with_window()
+    test_limit()
+    test_mem_write_trigger()
+    test_stop_on()

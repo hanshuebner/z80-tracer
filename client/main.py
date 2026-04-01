@@ -20,6 +20,7 @@ from typing import Optional, BinaryIO
 from . import z80_decoder as dec
 from .z80_state import Z80State
 from .z80_loop import LoopDetector
+from .trace_filter import TraceFilter, FilterConfig, parse_address_range, parse_trigger_addr
 
 
 # -- Wire protocol (matches firmware) --
@@ -261,10 +262,13 @@ def format_instruction(instr, reg_changes):
 
 # -- Main trace loop --
 
-def run_trace(source: BinaryIO, raw_output=False, is_file=False, detect_loops=True):
+def run_trace(source: BinaryIO, raw_output=False, is_file=False,
+              detect_loops=True, filter_config=None):
     assembler = InstructionAssembler()
     state = Z80State()
     loop_det = LoopDetector()
+    trace_filter = (TraceFilter(filter_config, format_instruction)
+                    if filter_config and filter_config.has_any_config else None)
     instr_count = 0
 
     buf = bytearray()
@@ -307,23 +311,23 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False, detect_loops=Tr
 
                 # Loop detection
                 state_key = state.snapshot_key()
-                action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
+                loop_action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
+                reg_changes = state.format_changed(prev_snap)
 
-                if action == "normal":
-                    reg_changes = state.format_changed(prev_snap)
-                    line = format_instruction(instr, reg_changes)
-                    print(line)
-
-                elif action == "loop_exit":
-                    summary = loop_det.loop_summary()
-                    if summary:
-                        print(summary)
-                    # Print the current instruction that broke the loop
-                    reg_changes = state.format_changed(prev_snap)
-                    line = format_instruction(instr, reg_changes)
-                    print(line)
-
-                # action == "suppress": do nothing
+                if trace_filter:
+                    result = trace_filter.evaluate(instr, reg_changes, loop_action)
+                    for line in result.lines:
+                        print(line)
+                    if result.stop:
+                        raise KeyboardInterrupt  # clean exit via existing handler
+                else:
+                    if loop_action == "normal":
+                        print(format_instruction(instr, reg_changes))
+                    elif loop_action == "loop_exit":
+                        summary = loop_det.loop_summary()
+                        if summary:
+                            print(summary)
+                        print(format_instruction(instr, reg_changes))
 
     except KeyboardInterrupt:
         pass
@@ -376,12 +380,67 @@ def main():
     parser.add_argument(
         "--hexdump", action="store_true",
         help="Dump raw USB bytes in hex and exit (diagnostic)")
+
+    # Filtering and triggering
+    parser.add_argument(
+        "--mask", action="append", default=[], metavar="START-END",
+        help="Suppress output for PC in range (e.g., 0xF000-0xFFFF)")
+    parser.add_argument(
+        "--start-at", type=lambda x: int(x, 0), default=None, metavar="ADDR",
+        help="Start tracing when PC reaches this address")
+    parser.add_argument(
+        "--stop-at", type=lambda x: int(x, 0), default=None, metavar="ADDR",
+        help="Stop tracing when PC reaches this address")
+    parser.add_argument(
+        "--start-on", default=None, metavar="PATTERN",
+        help="Start tracing on mnemonic match (regex)")
+    parser.add_argument(
+        "--stop-on", default=None, metavar="PATTERN",
+        help="Stop tracing on mnemonic match (regex)")
+    parser.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="Stop after printing N instructions")
+    parser.add_argument(
+        "--trigger-mem-read", action="append", default=[], metavar="ADDR[=VAL]",
+        help="Trigger on memory read (e.g., 0xC000 or 0xC000=0xFF)")
+    parser.add_argument(
+        "--trigger-mem-write", action="append", default=[], metavar="ADDR[=VAL]",
+        help="Trigger on memory write")
+    parser.add_argument(
+        "--trigger-io-read", action="append", default=[], metavar="PORT[=VAL]",
+        help="Trigger on I/O port read")
+    parser.add_argument(
+        "--trigger-io-write", action="append", default=[], metavar="PORT[=VAL]",
+        help="Trigger on I/O port write")
+    parser.add_argument(
+        "--trigger-int", action="store_true",
+        help="Trigger on interrupt (unexpected PC jump to RST vector)")
+    parser.add_argument(
+        "--window", type=int, default=0, metavar="N",
+        help="Show N instructions before trigger event")
+
     args = parser.parse_args()
+
+    # Build filter config from args
+    fcfg = FilterConfig(
+        address_masks=[parse_address_range(m) for m in args.mask],
+        start_at=args.start_at,
+        stop_at=args.stop_at,
+        start_on=args.start_on,
+        stop_on=args.stop_on,
+        limit=args.limit,
+        mem_read_triggers=[parse_trigger_addr(t) for t in args.trigger_mem_read],
+        mem_write_triggers=[parse_trigger_addr(t) for t in args.trigger_mem_write],
+        io_read_triggers=[parse_trigger_addr(t) for t in args.trigger_io_read],
+        io_write_triggers=[parse_trigger_addr(t) for t in args.trigger_io_write],
+        trigger_int=args.trigger_int,
+        window_size=args.window,
+    )
 
     if args.replay:
         with open(args.replay, "rb") as f:
             run_trace(f, raw_output=args.raw, is_file=True,
-                      detect_loops=args.loops)
+                      detect_loops=args.loops, filter_config=fcfg)
         return
 
     if not args.port:
@@ -436,7 +495,8 @@ def main():
 
     print("Tracing -- Ctrl+C to stop")
     try:
-        run_trace(ser, raw_output=args.raw, detect_loops=args.loops)
+        run_trace(ser, raw_output=args.raw, detect_loops=args.loops,
+                  filter_config=fcfg)
     except KeyboardInterrupt:
         pass
     finally:
