@@ -185,8 +185,8 @@ for (const pin of Z80_PIN_ORDER) {
 // PGA targets: GND=A1, USB_DM=A7, USB_DP=A6, VBUS=A3
 const usbWires = [
   { signal:"USB GND",  group:"usb",
-    fromLabel:()=>"USB-C GND", toLabel:()=>"PGA A1 (GND)",
-    srcXY:()=>usbPinXY(0), dstXY:()=>pgaXY(0,1) },
+    fromLabel:()=>"USB-C GND", toLabel:()=>"PGA A10 (GND)",
+    srcXY:()=>usbPinXY(0), dstXY:()=>pgaXY(0,10) },
   { signal:"USB D\u2013", group:"usb",
     fromLabel:()=>"USB-C D\u2013", toLabel:()=>"PGA A7 (USB_DM)",
     srcXY:()=>usbPinXY(1), dstXY:()=>pgaXY(0,7) },
@@ -208,12 +208,12 @@ const btnWires = [
   { signal:"RUN btn \u2192 GND", group:"btn",
     fromLabel:()=>"RUN button (right pins)", toLabel:()=>"PGA J1 (GND)",
     srcXY:()=>btnPinXY(BTN_RUN_X, 1, 0), dstXY:()=>pgaXY(9,1) },
-  { signal:"BOOTSEL btn \u2192 BOOTSEL", group:"btn",
-    fromLabel:()=>"BOOTSEL button (left pins)", toLabel:()=>"PGA A8 (BOOTSEL)",
-    srcXY:()=>btnPinXY(BTN_BOOT_X, 0, 0), dstXY:()=>pgaXY(0,8) },
   { signal:"BOOTSEL btn \u2192 GND", group:"btn",
-    fromLabel:()=>"BOOTSEL button (right pins)", toLabel:()=>"PGA J10 (GND)",
-    srcXY:()=>btnPinXY(BTN_BOOT_X, 1, 0), dstXY:()=>pgaXY(9,10) },
+    fromLabel:()=>"BOOTSEL button (left pins)", toLabel:()=>"PGA J10 (GND)",
+    srcXY:()=>btnPinXY(BTN_BOOT_X, 0, 0), dstXY:()=>pgaXY(9,10) },
+  { signal:"BOOTSEL btn \u2192 BOOTSEL", group:"btn",
+    fromLabel:()=>"BOOTSEL button (right pins)", toLabel:()=>"PGA A8 (BOOTSEL)",
+    srcXY:()=>btnPinXY(BTN_BOOT_X, 1, 0), dstXY:()=>pgaXY(0,8) },
 ];
 
 // Combine all wires: Z80 first, then USB, then buttons
