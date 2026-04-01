@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.13)
 
 set(PICO_SDK_PATH $ENV{HOME}/Development/privat/pico-sdk)
-set(PICO_BOARD pico2)
-set(PICO_PLATFORM rp2350)
+set(PICO_BOARD pga2350)
+set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/board)
+set(PICO_PLATFORM rp2350-arm-s)
 
 include(${PICO_SDK_PATH}/pico_sdk_init.cmake)
 
