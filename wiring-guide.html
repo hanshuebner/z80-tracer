@@ -79,14 +79,14 @@ const PGA_X_START = 570;  // x of col-1 in bottom view (rightmost)
 const PGA_Y_START = 115;
 
 // USB-C breakout: 4 pins in a row, above PGA socket
-// In bottom view: VBUS, D+, D-, GND left to right
+// In bottom view (mirrored): GND, D-, D+, VBUS left to right
 const USB_X_START = PGA_X_START - 4 * SP;  // centered-ish above PGA
 const USB_Y = 50;
 const USB_PINS = [
-  { label: "VBUS", idx: 0 },
-  { label: "D+",   idx: 1 },
-  { label: "D\u2013", idx: 2 },  // D−
-  { label: "GND",  idx: 3 },
+  { label: "GND",  idx: 0 },
+  { label: "D\u2013", idx: 1 },  // D−
+  { label: "D+",   idx: 2 },
+  { label: "VBUS", idx: 3 },
 ];
 
 // Buttons: 6mm x 6mm, 4 pins (2 close pairs). Below PGA socket.
@@ -96,8 +96,8 @@ const BTN_Y = PGA_Y_START + 10 * SP + 30;  // below row J
 const BTN_RUN_X = PGA_X_START - 4 * SP;
 const BTN_BOOT_X = PGA_X_START - 7 * SP;
 const BTN_W = 3 * SP;  // ~6mm wide
-const BTN_H = 2.5 * SP; // ~6mm tall
-const BTN_PIN_DY = 8;  // two close pins
+const BTN_H = 3 * SP;  // ~6mm tall
+const BTN_PIN_DY = 10; // close pin pair spacing
 
 function z80XY(pin) {
   if (pin >= 1 && pin <= 20)
@@ -114,10 +114,11 @@ function usbPinXY(idx) {
 }
 
 function btnPinXY(btnX, side, pinIdx) {
-  // side: 0=left, 1=right. pinIdx: 0=top, 1=bottom (close pair)
+  // side: 0=left, 1=right. pinIdx: 0=top, 1=bottom (close pair near corners)
+  const pinInset = 4; // inset from edge
   return {
-    x: btnX + side * BTN_W,
-    y: BTN_Y + BTN_H/2 + (pinIdx - 0.5) * BTN_PIN_DY,
+    x: btnX + (side === 0 ? pinInset : BTN_W - pinInset),
+    y: BTN_Y + (pinIdx === 0 ? pinInset : BTN_H - pinInset),
   };
 }
 
@@ -180,39 +181,39 @@ for (const pin of Z80_PIN_ORDER) {
 }
 
 // ===== USB-C breakout wires =====
-// USB breakout pin -> PGA pin. In bottom view, PGA cols are mirrored.
-// USB_DP = A6, USB_DM = A7, VBUS = A3, GND = A1
+// Breakout pin order (bottom view, L-R): GND, D-, D+, VBUS (idx 0-3)
+// PGA targets: GND=A1, USB_DM=A7, USB_DP=A6, VBUS=A3
 const usbWires = [
-  { signal:"USB VBUS", group:"usb", usbIdx:0,
-    fromLabel:()=>"USB-C VBUS", toLabel:()=>"PGA A3 (VBUS)",
-    srcXY:()=>usbPinXY(0), dstXY:()=>pgaXY(0,3) },
-  { signal:"USB D+",   group:"usb", usbIdx:1,
-    fromLabel:()=>"USB-C D+", toLabel:()=>"PGA A6 (USB_DP)",
-    srcXY:()=>usbPinXY(1), dstXY:()=>pgaXY(0,6) },
-  { signal:"USB D\u2013", group:"usb", usbIdx:2,
-    fromLabel:()=>"USB-C D\u2013", toLabel:()=>"PGA A7 (USB_DM)",
-    srcXY:()=>usbPinXY(2), dstXY:()=>pgaXY(0,7) },
-  { signal:"USB GND",  group:"usb", usbIdx:3,
+  { signal:"USB GND",  group:"usb",
     fromLabel:()=>"USB-C GND", toLabel:()=>"PGA A1 (GND)",
-    srcXY:()=>usbPinXY(3), dstXY:()=>pgaXY(0,1) },
+    srcXY:()=>usbPinXY(0), dstXY:()=>pgaXY(0,1) },
+  { signal:"USB D\u2013", group:"usb",
+    fromLabel:()=>"USB-C D\u2013", toLabel:()=>"PGA A7 (USB_DM)",
+    srcXY:()=>usbPinXY(1), dstXY:()=>pgaXY(0,7) },
+  { signal:"USB D+",   group:"usb",
+    fromLabel:()=>"USB-C D+", toLabel:()=>"PGA A6 (USB_DP)",
+    srcXY:()=>usbPinXY(2), dstXY:()=>pgaXY(0,6) },
+  { signal:"USB VBUS", group:"usb",
+    fromLabel:()=>"USB-C VBUS", toLabel:()=>"PGA A3 (VBUS)",
+    srcXY:()=>usbPinXY(3), dstXY:()=>pgaXY(0,3) },
 ];
 
 // ===== Button wires =====
-// RUN button: one side to PGA A5 (RUN), other side to GND (A10)
-// BOOTSEL button: one side to PGA A8 (BOOTSEL), other side to GND (B9)
+// RUN button: one side to PGA A5 (RUN), other side to J1 (GND)
+// BOOTSEL button: one side to PGA A8 (BOOTSEL), other side to J10 (GND)
 const btnWires = [
   { signal:"RUN btn \u2192 RUN", group:"btn",
     fromLabel:()=>"RUN button (left pins)", toLabel:()=>"PGA A5 (RUN)",
     srcXY:()=>btnPinXY(BTN_RUN_X, 0, 0), dstXY:()=>pgaXY(0,5) },
   { signal:"RUN btn \u2192 GND", group:"btn",
-    fromLabel:()=>"RUN button (right pins)", toLabel:()=>"PGA A10 (GND)",
-    srcXY:()=>btnPinXY(BTN_RUN_X, 1, 0), dstXY:()=>pgaXY(0,10) },
+    fromLabel:()=>"RUN button (right pins)", toLabel:()=>"PGA J1 (GND)",
+    srcXY:()=>btnPinXY(BTN_RUN_X, 1, 0), dstXY:()=>pgaXY(9,1) },
   { signal:"BOOTSEL btn \u2192 BOOTSEL", group:"btn",
     fromLabel:()=>"BOOTSEL button (left pins)", toLabel:()=>"PGA A8 (BOOTSEL)",
     srcXY:()=>btnPinXY(BTN_BOOT_X, 0, 0), dstXY:()=>pgaXY(0,8) },
   { signal:"BOOTSEL btn \u2192 GND", group:"btn",
-    fromLabel:()=>"BOOTSEL button (right pins)", toLabel:()=>"PGA B9 (GND)",
-    srcXY:()=>btnPinXY(BTN_BOOT_X, 1, 0), dstXY:()=>pgaXY(1,9) },
+    fromLabel:()=>"BOOTSEL button (right pins)", toLabel:()=>"PGA J10 (GND)",
+    srcXY:()=>btnPinXY(BTN_BOOT_X, 1, 0), dstXY:()=>pgaXY(9,10) },
 ];
 
 // Combine all wires: Z80 first, then USB, then buttons
@@ -335,7 +336,7 @@ function initSVG() {
     }));
     // Button cap (circle in center)
     btng.appendChild(svgEl("circle", {
-      cx: bx + BTN_W/2, cy: by + BTN_H/2, r: 10,
+      cx: bx + BTN_W/2, cy: by + BTN_H/2, r: 30,
       fill: "#2a2a2a", stroke: "#666", "stroke-width": 1
     }));
     btng.appendChild(svgText(bx + BTN_W/2, by - 8, label, { fontSize:10, fill:"#fbbf24" }));
