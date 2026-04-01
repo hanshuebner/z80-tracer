@@ -12,8 +12,13 @@ decoder. Use at your own risk and plan to debug.
 
 ## Hardware
 
-Connect the PGA2350 directly to the Z80 bus (active accent level conversion
-not required for CMOS Z80 variants running at 3.3 V):
+Connect the PGA2350 directly to the Z80 bus — no level shifters are
+needed. The RP2350 GPIOs tolerate 5V inputs provided the RP2350 is
+powered before the Z80. **If the Z80 drives 5V signals into an
+unpowered RP2350, the GPIO protection diodes will forward-bias into
+the unpowered 3.3V rail, which can damage the chip or cause
+latch-up.** Ensure your power sequencing is correct: RP2350 on first,
+Z80 on second; Z80 off first, RP2350 off second.
 
 | PGA2350 GPIO | Z80 Signal | Pin |
 |---|---|---|
@@ -28,8 +33,12 @@ not required for CMOS Z80 variants running at 3.3 V):
 | 30 | CLK | 6 |
 | 31 | /HALT | 18 |
 | 32 | /WAIT | 24 (active-low output) |
+| 33 | /INT | 16 |
+| 34 | /NMI | 17 |
+| 35 | /RESET | 26 |
 
-NMOS Z80 parts output 5 V and will need level shifters.
+See `WIRING.md` for the complete perfboard wiring guide and
+`wiring-guide.html` for an interactive step-by-step wiring aid.
 
 ## Building the firmware
 
