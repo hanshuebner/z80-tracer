@@ -260,6 +260,21 @@ def format_instruction(instr, reg_changes):
     return f"{addr_str}: {raw} {mnem} {comment}"
 
 
+# -- Interrupt detection --
+
+# Effect types that can cause a PC discontinuity (not an interrupt)
+_BRANCH_EFFECTS = frozenset({
+    "jp", "jr", "call", "ret", "rst", "reti", "retn", "djnz", "halt",
+    "jp_hl", "jp_ix",
+    "block_ld", "block_cp", "in_block", "out_block",  # LDIR etc. repeat at same PC
+    "unknown",
+})
+
+def _is_branch(instr):
+    """True if this instruction can change PC non-sequentially."""
+    return instr.effect[0] in _BRANCH_EFFECTS
+
+
 # -- Main trace loop --
 
 def run_trace(source: BinaryIO, raw_output=False, is_file=False,
@@ -270,6 +285,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
     trace_filter = (TraceFilter(filter_config, format_instruction)
                     if filter_config and filter_config.has_any_config else None)
     instr_count = 0
+    prev_instr = None
 
     buf = bytearray()
 
@@ -309,10 +325,18 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 state.execute(instr)
                 instr_count += 1
 
+                # Interrupt detection: unexpected PC discontinuity
+                if prev_instr is not None:
+                    expected_pc = (prev_instr.pc + prev_instr.length) & 0xFFFF
+                    if instr.pc != expected_pc and not _is_branch(prev_instr):
+                        print(f"; --- IRQ: {prev_instr.pc + prev_instr.length:04X} -> {instr.pc:04X} ---")
+
                 # Loop detection
                 state_key = state.snapshot_key()
                 loop_action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
                 reg_changes = state.format_changed(prev_snap)
+
+                prev_instr = instr
 
                 if trace_filter:
                     result = trace_filter.evaluate(instr, reg_changes, loop_action)
