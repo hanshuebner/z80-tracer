@@ -564,15 +564,9 @@ def _do_alu_self(st, op):
 def _do_alu(st, op, val):
     """Execute ALU operation on A. op: 0=ADD,1=ADC,2=SUB,3=SBC,4=AND,5=XOR,6=OR,7=CP"""
     if val is None or st.a is None:
-        if op == 5 and val is not None and st.a is not None:
-            pass  # will be handled below
-        elif op == 5 and val == st.a:
-            # XOR A, A always gives 0 (but we don't know if src==A here)
-            pass
-        else:
-            st.a = None
-            st.f = None
-            return
+        st.a = None
+        st.f = None
+        return
 
     a = st.a
     carry = (st.f >> FLAG_C) & 1 if st.f is not None else None

@@ -42,9 +42,14 @@ static void gpio_setup(void) {
         gpio_set_dir(ctrl_pins[i], GPIO_IN);
         gpio_disable_pulls(ctrl_pins[i]);
     }
+    // /WAIT: high-Z by default (input, no pulls).
+    // Only driven low (output) when asserting flow control.
+    // The host system's pull-up holds it high when we're not driving.
     gpio_init(PIN_WAIT);
-    gpio_set_dir(PIN_WAIT, GPIO_OUT);
-    gpio_put(PIN_WAIT, 1);
+    gpio_set_dir(PIN_WAIT, GPIO_IN);
+    gpio_disable_pulls(PIN_WAIT);
+    gpio_put(PIN_WAIT, 0);  // pre-set output latch to LOW so switching
+                              // to output mode immediately asserts /WAIT
 }
 
 // ---- PIO setup ----
@@ -112,10 +117,10 @@ static inline uint32_t ring_available(uint32_t head, uint32_t tail) {
 
 static void flow_control_update(uint32_t total_pending) {
     if (!wait_asserted && total_pending >= FLOW_CTRL_ASSERT_THRESHOLD) {
-        gpio_put(PIN_WAIT, 0);
+        gpio_set_dir(PIN_WAIT, GPIO_OUT);  // drive low (asserted)
         wait_asserted = true;
     } else if (wait_asserted && total_pending <= FLOW_CTRL_RELEASE_THRESHOLD) {
-        gpio_put(PIN_WAIT, 1);
+        gpio_set_dir(PIN_WAIT, GPIO_IN);   // release (high-Z)
         wait_asserted = false;
     }
 }
@@ -187,9 +192,9 @@ static void capture_stop(void) {
     dma_channel_abort(dma_chan_read);
     dma_channel_abort(dma_chan_write);
 
-    // Release /WAIT if asserted
+    // Release /WAIT (high-Z)
     if (wait_asserted) {
-        gpio_put(PIN_WAIT, 1);
+        gpio_set_dir(PIN_WAIT, GPIO_IN);
         wait_asserted = false;
     }
 }
@@ -199,10 +204,10 @@ static void capture_stop(void) {
 int main(void) {
     stdio_init_all();
 
-    // Release /WAIT so Z80 runs during USB enumeration
+    // Ensure /WAIT is high-Z so we don't interfere with the bus
     gpio_init(PIN_WAIT);
-    gpio_set_dir(PIN_WAIT, GPIO_OUT);
-    gpio_put(PIN_WAIT, 1);
+    gpio_set_dir(PIN_WAIT, GPIO_IN);
+    gpio_disable_pulls(PIN_WAIT);
 
     gpio_setup();
     pio_setup();
