@@ -34,154 +34,202 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   </div>
 </div>
 <div id="svg-container">
-  <svg id="board" viewBox="0 0 1200 720"></svg>
+  <svg id="board" viewBox="0 0 1200 780"></svg>
 </div>
 <div id="info-panel">
   <span id="info-signal">--</span>
-  <span class="info-detail">Z80 pin: <b id="info-z80">--</b></span>
-  <span class="info-detail">PGA grid: <b id="info-pga">--</b></span>
-  <span class="info-detail">GPIO: <b id="info-gpio">--</b></span>
+  <span class="info-detail">From: <b id="info-from">--</b></span>
+  <span class="info-detail">To: <b id="info-to">--</b></span>
+  <span class="info-detail"><b id="info-gpio">--</b></span>
   <span id="info-hint">Use <span class="kbd">&larr;</span> <span class="kbd">&rarr;</span> arrow keys to navigate</span>
 </div>
 
 <script>
-// ===== PGA2350 PIN MAP (top view, from pinout diagram) =====
-// Row A-J (top to bottom), Column 1-10 (left to right in top view)
-// Column 1 = LEFT in top view = RIGHT in bottom/solder view
-//
-// Authoritative source: pga2350_pinout_diagram.pdf + schematic PIM722
-
+// ===== PGA2350 PIN MAP =====
 const PGA_ROW_LABELS = "ABCDEFGHIJ";
-
-// All populated PGA pins: [row_index, col, label]
 const PGA_PINS = [
-  // Row A (top) — A1 and A10 are GND
+  // Row A — A1, A10 are GND
   [0,1,"GND"],[0,2,"GP1"],[0,3,"VBUS"],[0,4,"3V3_EN"],[0,5,"RUN"],
   [0,6,"USB_DP"],[0,7,"USB_DM"],[0,8,"BOOTSEL"],[0,9,"GP46"],[0,10,"GND"],
-  // Row B — B2 and B9 are GND
+  // Row B — B2, B9 are GND
   [1,1,"GP2"],[1,2,"GND"],[1,3,"GP0"],[1,4,"3V3"],[1,5,"ADC_VRF"],
   [1,6,"SWCLK"],[1,7,"SWDIO"],[1,8,"GP47"],[1,9,"GND"],[1,10,"GP45"],
-  // Rows C-H: only columns 1,2 (left) and 9,10 (right)
   [2,1,"GP4"],[2,2,"GP3"],   [2,9,"GP43"],[2,10,"GP44"],
   [3,1,"GP6"],[3,2,"GP5"],   [3,9,"GP42"],[3,10,"GP41"],
   [4,1,"GP8"],[4,2,"GP7"],   [4,9,"GP39"],[4,10,"GP40"],
   [5,1,"GP10"],[5,2,"GP9"],  [5,9,"GP37"],[5,10,"GP38"],
   [6,1,"GP12"],[6,2,"GP11"], [6,9,"GP35"],[6,10,"GP36"],
   [7,1,"GP14"],[7,2,"GP13"], [7,9,"GP33"],[7,10,"GP34"],
-  // Row I (full, inner bottom)
   [8,1,"GP16"],[8,2,"GP15"],[8,3,"GP20"],[8,4,"GP21"],
   [8,5,"GP22"],[8,6,"GP25"],[8,7,"GP27"],[8,8,"GP28"],
   [8,9,"GP31"],[8,10,"GP32"],
-  // Row J (outer bottom, no J1 or J10)
-  // Row J — J1 and J10 are GND
+  // Row J — J1, J10 are GND
   [9,1,"GND"],[9,2,"GP17"],[9,3,"GP18"],[9,4,"GP19"],[9,5,"GP23"],
   [9,6,"GP24"],[9,7,"GP26"],[9,8,"GP29"],[9,9,"GP30"],[9,10,"GND"],
 ];
 
-// ===== WIRE DEFINITIONS (all connections) =====
-// group: "addr" | "data" | "ctrl" | "power"
+// ===== LAYOUT =====
+const SP = 28; // pin spacing (0.1" at scale)
+
+const Z80_X = 190;
+const Z80_Y_START = 90;
+const Z80_COL_GAP = 80;
+
+const PGA_X_START = 570;  // x of col-1 in bottom view (rightmost)
+const PGA_Y_START = 115;
+
+// USB-C breakout: 4 pins in a row, above PGA socket
+// In bottom view: VBUS, D+, D-, GND left to right
+const USB_X_START = PGA_X_START - 4 * SP;  // centered-ish above PGA
+const USB_Y = 50;
+const USB_PINS = [
+  { label: "VBUS", idx: 0 },
+  { label: "D+",   idx: 1 },
+  { label: "D\u2013", idx: 2 },  // D−
+  { label: "GND",  idx: 3 },
+];
+
+// Buttons: 6mm x 6mm, 4 pins (2 close pairs). Below PGA socket.
+// Each button has 2 pins on each side, spaced ~0.1" apart vertically,
+// with ~0.3" across. One side connects to the PGA signal, other to GND.
+const BTN_Y = PGA_Y_START + 10 * SP + 30;  // below row J
+const BTN_RUN_X = PGA_X_START - 4 * SP;
+const BTN_BOOT_X = PGA_X_START - 7 * SP;
+const BTN_W = 3 * SP;  // ~6mm wide
+const BTN_H = 2.5 * SP; // ~6mm tall
+const BTN_PIN_DY = 8;  // two close pins
+
+function z80XY(pin) {
+  if (pin >= 1 && pin <= 20)
+    return { x: Z80_X + Z80_COL_GAP/2, y: Z80_Y_START + (pin - 1) * SP };
+  return { x: Z80_X - Z80_COL_GAP/2, y: Z80_Y_START + (40 - pin) * SP };
+}
+
+function pgaXY(row, col) {
+  return { x: PGA_X_START - (col - 1) * SP, y: PGA_Y_START + row * SP };
+}
+
+function usbPinXY(idx) {
+  return { x: USB_X_START + idx * SP, y: USB_Y };
+}
+
+function btnPinXY(btnX, side, pinIdx) {
+  // side: 0=left, 1=right. pinIdx: 0=top, 1=bottom (close pair)
+  return {
+    x: btnX + side * BTN_W,
+    y: BTN_Y + BTN_H/2 + (pinIdx - 0.5) * BTN_PIN_DY,
+  };
+}
+
+// ===== Z80 WIRES =====
 const WIRE_DB = {
-  // Address bus
-  30: { signal:"A0",  gpio:"GP0",  row:1, col:3,  group:"addr" },
-  31: { signal:"A1",  gpio:"GP1",  row:0, col:2,  group:"addr" },
-  32: { signal:"A2",  gpio:"GP2",  row:1, col:1,  group:"addr" },
-  33: { signal:"A3",  gpio:"GP3",  row:2, col:2,  group:"addr" },
-  34: { signal:"A4",  gpio:"GP4",  row:2, col:1,  group:"addr" },
-  35: { signal:"A5",  gpio:"GP5",  row:3, col:2,  group:"addr" },
-  36: { signal:"A6",  gpio:"GP6",  row:3, col:1,  group:"addr" },
-  37: { signal:"A7",  gpio:"GP7",  row:4, col:2,  group:"addr" },
-  38: { signal:"A8",  gpio:"GP8",  row:4, col:1,  group:"addr" },
-  39: { signal:"A9",  gpio:"GP9",  row:5, col:2,  group:"addr" },
-  40: { signal:"A10", gpio:"GP10", row:5, col:1,  group:"addr" },
-   1: { signal:"A11", gpio:"GP11", row:6, col:2,  group:"addr" },
-   2: { signal:"A12", gpio:"GP12", row:6, col:1,  group:"addr" },
-   3: { signal:"A13", gpio:"GP13", row:7, col:2,  group:"addr" },
-   4: { signal:"A14", gpio:"GP14", row:7, col:1,  group:"addr" },
-   5: { signal:"A15", gpio:"GP15", row:8, col:2,  group:"addr" },
-  // Data bus
-  14: { signal:"D0",  gpio:"GP16", row:8, col:1,  group:"data" },
-  15: { signal:"D1",  gpio:"GP17", row:9, col:2,  group:"data" },
-  12: { signal:"D2",  gpio:"GP18", row:9, col:3,  group:"data" },
-   8: { signal:"D3",  gpio:"GP19", row:9, col:4,  group:"data" },
-   7: { signal:"D4",  gpio:"GP20", row:8, col:3,  group:"data" },
-   9: { signal:"D5",  gpio:"GP21", row:8, col:4,  group:"data" },
-  10: { signal:"D6",  gpio:"GP22", row:8, col:5,  group:"data" },
-  13: { signal:"D7",  gpio:"GP23", row:9, col:5,  group:"data" },
-  // Control signals
-  27: { signal:"/M1",   gpio:"GP24", row:9, col:6,  group:"ctrl" },
-  19: { signal:"/MREQ", gpio:"GP25", row:8, col:6,  group:"ctrl" },
-  20: { signal:"/IORQ", gpio:"GP26", row:9, col:7,  group:"ctrl" },
-  21: { signal:"/RD",   gpio:"GP27", row:8, col:7,  group:"ctrl" },
-  22: { signal:"/WR",   gpio:"GP28", row:8, col:8,  group:"ctrl" },
-  28: { signal:"/RFSH", gpio:"GP29", row:9, col:8,  group:"ctrl" },
-   6: { signal:"CLK",   gpio:"GP30", row:9, col:9,  group:"ctrl" },
-  18: { signal:"/HALT", gpio:"GP31", row:8, col:9,  group:"ctrl" },
-  24: { signal:"/WAIT", gpio:"GP32", row:8, col:10, group:"ctrl" },
-  // New: /INT, /NMI, /RESET
-  16: { signal:"/INT",   gpio:"GP33", row:7, col:9,  group:"ctrl" },
-  17: { signal:"/NMI",   gpio:"GP34", row:7, col:10, group:"ctrl" },
-  26: { signal:"/RESET", gpio:"GP35", row:6, col:9,  group:"ctrl" },
-  // Power (only GND — Z80 5V is powered separately, not via RP2350)
-  29: { signal:"GND",  gpio:"GND",  row:0, col:1,  group:"power" },
+  30:{signal:"A0",  gpio:"GP0",  row:1,col:3,  group:"addr"},
+  31:{signal:"A1",  gpio:"GP1",  row:0,col:2,  group:"addr"},
+  32:{signal:"A2",  gpio:"GP2",  row:1,col:1,  group:"addr"},
+  33:{signal:"A3",  gpio:"GP3",  row:2,col:2,  group:"addr"},
+  34:{signal:"A4",  gpio:"GP4",  row:2,col:1,  group:"addr"},
+  35:{signal:"A5",  gpio:"GP5",  row:3,col:2,  group:"addr"},
+  36:{signal:"A6",  gpio:"GP6",  row:3,col:1,  group:"addr"},
+  37:{signal:"A7",  gpio:"GP7",  row:4,col:2,  group:"addr"},
+  38:{signal:"A8",  gpio:"GP8",  row:4,col:1,  group:"addr"},
+  39:{signal:"A9",  gpio:"GP9",  row:5,col:2,  group:"addr"},
+  40:{signal:"A10", gpio:"GP10", row:5,col:1,  group:"addr"},
+   1:{signal:"A11", gpio:"GP11", row:6,col:2,  group:"addr"},
+   2:{signal:"A12", gpio:"GP12", row:6,col:1,  group:"addr"},
+   3:{signal:"A13", gpio:"GP13", row:7,col:2,  group:"addr"},
+   4:{signal:"A14", gpio:"GP14", row:7,col:1,  group:"addr"},
+   5:{signal:"A15", gpio:"GP15", row:8,col:2,  group:"addr"},
+  14:{signal:"D0",  gpio:"GP16", row:8,col:1,  group:"data"},
+  15:{signal:"D1",  gpio:"GP17", row:9,col:2,  group:"data"},
+  12:{signal:"D2",  gpio:"GP18", row:9,col:3,  group:"data"},
+   8:{signal:"D3",  gpio:"GP19", row:9,col:4,  group:"data"},
+   7:{signal:"D4",  gpio:"GP20", row:8,col:3,  group:"data"},
+   9:{signal:"D5",  gpio:"GP21", row:8,col:4,  group:"data"},
+  10:{signal:"D6",  gpio:"GP22", row:8,col:5,  group:"data"},
+  13:{signal:"D7",  gpio:"GP23", row:9,col:5,  group:"data"},
+  27:{signal:"/M1",   gpio:"GP24", row:9,col:6,  group:"ctrl"},
+  19:{signal:"/MREQ", gpio:"GP25", row:8,col:6,  group:"ctrl"},
+  20:{signal:"/IORQ", gpio:"GP26", row:9,col:7,  group:"ctrl"},
+  21:{signal:"/RD",   gpio:"GP27", row:8,col:7,  group:"ctrl"},
+  22:{signal:"/WR",   gpio:"GP28", row:8,col:8,  group:"ctrl"},
+  28:{signal:"/RFSH", gpio:"GP29", row:9,col:8,  group:"ctrl"},
+   6:{signal:"CLK",   gpio:"GP30", row:9,col:9,  group:"ctrl"},
+  18:{signal:"/HALT", gpio:"GP31", row:8,col:9,  group:"ctrl"},
+  24:{signal:"/WAIT", gpio:"GP32", row:8,col:10, group:"ctrl"},
+  16:{signal:"/INT",   gpio:"GP33", row:7,col:9,  group:"ctrl"},
+  17:{signal:"/NMI",   gpio:"GP34", row:7,col:10, group:"ctrl"},
+  26:{signal:"/RESET", gpio:"GP35", row:6,col:9,  group:"ctrl"},
+  29:{signal:"GND",  gpio:"GND",  row:0,col:1,  group:"power"},
 };
 
-// ===== SOLDERING ORDER: Z80 pin 40, 1, 39, 2, 38, 3, ... =====
-// Alternates outside-in on the DIP socket, skipping unwired pins (23, 25)
+// Z80 wires in alternating outside-in order
 const Z80_PIN_ORDER = [];
 for (let i = 0; i < 20; i++) {
-  Z80_PIN_ORDER.push(40 - i);  // right col top-down (bottom view: left)
-  Z80_PIN_ORDER.push(1 + i);   // left col top-down (bottom view: right)
+  Z80_PIN_ORDER.push(40 - i);
+  Z80_PIN_ORDER.push(1 + i);
 }
 const allWires = [];
 for (const pin of Z80_PIN_ORDER) {
-  if (WIRE_DB[pin]) {
-    allWires.push({ z80pin: pin, ...WIRE_DB[pin] });
-  }
+  if (WIRE_DB[pin]) allWires.push({
+    z80pin: pin, ...WIRE_DB[pin],
+    fromLabel: () => `Z80 pin ${pin}`,
+    toLabel: function() { return `PGA ${PGA_ROW_LABELS[this.row]}${this.col}`; },
+    srcXY: () => z80XY(pin),
+    dstXY: function() { return pgaXY(this.row, this.col); },
+  });
 }
+
+// ===== USB-C breakout wires =====
+// USB breakout pin -> PGA pin. In bottom view, PGA cols are mirrored.
+// USB_DP = A6, USB_DM = A7, VBUS = A3, GND = A1
+const usbWires = [
+  { signal:"USB VBUS", group:"usb", usbIdx:0,
+    fromLabel:()=>"USB-C VBUS", toLabel:()=>"PGA A3 (VBUS)",
+    srcXY:()=>usbPinXY(0), dstXY:()=>pgaXY(0,3) },
+  { signal:"USB D+",   group:"usb", usbIdx:1,
+    fromLabel:()=>"USB-C D+", toLabel:()=>"PGA A6 (USB_DP)",
+    srcXY:()=>usbPinXY(1), dstXY:()=>pgaXY(0,6) },
+  { signal:"USB D\u2013", group:"usb", usbIdx:2,
+    fromLabel:()=>"USB-C D\u2013", toLabel:()=>"PGA A7 (USB_DM)",
+    srcXY:()=>usbPinXY(2), dstXY:()=>pgaXY(0,7) },
+  { signal:"USB GND",  group:"usb", usbIdx:3,
+    fromLabel:()=>"USB-C GND", toLabel:()=>"PGA A1 (GND)",
+    srcXY:()=>usbPinXY(3), dstXY:()=>pgaXY(0,1) },
+];
+
+// ===== Button wires =====
+// RUN button: one side to PGA A5 (RUN), other side to GND (A10)
+// BOOTSEL button: one side to PGA A8 (BOOTSEL), other side to GND (B9)
+const btnWires = [
+  { signal:"RUN btn \u2192 RUN", group:"btn",
+    fromLabel:()=>"RUN button (left pins)", toLabel:()=>"PGA A5 (RUN)",
+    srcXY:()=>btnPinXY(BTN_RUN_X, 0, 0), dstXY:()=>pgaXY(0,5) },
+  { signal:"RUN btn \u2192 GND", group:"btn",
+    fromLabel:()=>"RUN button (right pins)", toLabel:()=>"PGA A10 (GND)",
+    srcXY:()=>btnPinXY(BTN_RUN_X, 1, 0), dstXY:()=>pgaXY(0,10) },
+  { signal:"BOOTSEL btn \u2192 BOOTSEL", group:"btn",
+    fromLabel:()=>"BOOTSEL button (left pins)", toLabel:()=>"PGA A8 (BOOTSEL)",
+    srcXY:()=>btnPinXY(BTN_BOOT_X, 0, 0), dstXY:()=>pgaXY(0,8) },
+  { signal:"BOOTSEL btn \u2192 GND", group:"btn",
+    fromLabel:()=>"BOOTSEL button (right pins)", toLabel:()=>"PGA B9 (GND)",
+    srcXY:()=>btnPinXY(BTN_BOOT_X, 1, 0), dstXY:()=>pgaXY(1,9) },
+];
+
+// Combine all wires: Z80 first, then USB, then buttons
+allWires.push(...usbWires, ...btnWires);
 const TOTAL = allWires.length;
 
 // Group colors
 const GROUP_COLORS = {
-  addr:  "#60a5fa",
-  data:  "#34d399",
-  ctrl:  "#fb923c",
-  power: "#f87171",
+  addr:"#60a5fa", data:"#34d399", ctrl:"#fb923c",
+  power:"#f87171", usb:"#c084fc", btn:"#fbbf24",
 };
 const GROUP_NAMES = {
-  addr: "Address Bus",
-  data: "Data Bus",
-  ctrl: "Control Signal",
-  power: "Power / GND",
+  addr:"Address Bus", data:"Data Bus", ctrl:"Control Signal",
+  power:"Power / GND", usb:"USB-C Breakout", btn:"Button",
 };
 
-// ===== LAYOUT =====
-const Z80_X = 200;
-const Z80_Y_START = 80;
-const Z80_PIN_SPACING = 28;
-const Z80_COL_GAP = 80;
-
-// PGA: col 1 is LEFT in top view, so in bottom view col 1 is on the RIGHT
-const PGA_X_START = 580;
-const PGA_Y_START = 90;
-const PGA_SPACING = 28;
-
-// Z80 bottom view: pins 1-20 on RIGHT column, pins 21-40 on LEFT column
-function z80XY(pin) {
-  if (pin >= 1 && pin <= 20) {
-    return { x: Z80_X + Z80_COL_GAP/2, y: Z80_Y_START + (pin - 1) * Z80_PIN_SPACING };
-  }
-  return { x: Z80_X - Z80_COL_GAP/2, y: Z80_Y_START + (40 - pin) * Z80_PIN_SPACING };
-}
-
-// PGA bottom view: mirror columns (col 1 goes to right side)
-function pgaXY(row, col) {
-  return {
-    x: PGA_X_START - (col - 1) * PGA_SPACING,
-    y: PGA_Y_START + row * PGA_SPACING,
-  };
-}
-
-// Z80 signal names (all 40 pins)
+// Z80 signal names
 const Z80_SIGNALS = {
   1:"A11",2:"A12",3:"A13",4:"A14",5:"A15",6:"CLK",
   7:"D4",8:"D3",9:"D5",10:"D6",11:"+5V",12:"D2",13:"D7",
@@ -191,7 +239,7 @@ const Z80_SIGNALS = {
   30:"A0",31:"A1",32:"A2",33:"A3",34:"A4",35:"A5",
   36:"A6",37:"A7",38:"A8",39:"A9",40:"A10"
 };
-const wiredZ80Pins = new Set(allWires.map(w => w.z80pin));
+const wiredZ80Pins = new Set(Object.keys(WIRE_DB).map(Number));
 
 // ===== SVG =====
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -215,22 +263,20 @@ function svgText(x, y, text, attrs = {}) {
 function initSVG() {
   // Perfboard
   const defs = svgEl("defs", {});
-  const pat = svgEl("pattern", { id:"dots", width:PGA_SPACING, height:PGA_SPACING, patternUnits:"userSpaceOnUse" });
-  pat.appendChild(svgEl("circle", { cx:PGA_SPACING/2, cy:PGA_SPACING/2, r:1.5, fill:"#3a3520" }));
+  const pat = svgEl("pattern", { id:"dots", width:SP, height:SP, patternUnits:"userSpaceOnUse" });
+  pat.appendChild(svgEl("circle", { cx:SP/2, cy:SP/2, r:1.5, fill:"#3a3520" }));
   defs.appendChild(pat);
   svg.appendChild(defs);
-  svg.appendChild(svgEl("rect", { x:30, y:30, width:1140, height:660, rx:8, fill:"#2d2b1f", stroke:"#4a4530", "stroke-width":2 }));
-  svg.appendChild(svgEl("rect", { x:30, y:30, width:1140, height:660, rx:8, fill:"url(#dots)" }));
+  svg.appendChild(svgEl("rect", { x:30, y:20, width:1140, height:740, rx:8, fill:"#2d2b1f", stroke:"#4a4530", "stroke-width":2 }));
+  svg.appendChild(svgEl("rect", { x:30, y:20, width:1140, height:740, rx:8, fill:"url(#dots)" }));
 
   // ---- Z80 Socket ----
   const z80g = svgEl("g", {});
   const sL = Z80_X - Z80_COL_GAP/2 - 16, sT = Z80_Y_START - 20;
-  const sW = Z80_COL_GAP + 32, sH = 19 * Z80_PIN_SPACING + 40;
+  const sW = Z80_COL_GAP + 32, sH = 19 * SP + 40;
   z80g.appendChild(svgEl("rect", { x:sL, y:sT, width:sW, height:sH, rx:4, fill:"#1a1a1a", stroke:"#555", "stroke-width":1.5 }));
-  // Pin 1 notch (top-right in bottom view)
   z80g.appendChild(svgEl("circle", { cx: Z80_X + Z80_COL_GAP/2, cy: sT + 10, r:5, fill:"none", stroke:"#666" }));
   z80g.appendChild(svgText(Z80_X, sT - 8, "Z80 DIP-40 (bottom view)", { fontSize:11, fill:"#999" }));
-
   for (let pin = 1; pin <= 40; pin++) {
     const { x, y } = z80XY(pin);
     const w = wiredZ80Pins.has(pin);
@@ -245,22 +291,15 @@ function initSVG() {
   // ---- PGA Socket ----
   const pgag = svgEl("g", {});
   const pR = PGA_X_START + 16, pT = PGA_Y_START - 16;
-  const pW = 9 * PGA_SPACING + 32, pH = 9 * PGA_SPACING + 32;
+  const pW = 9 * SP + 32, pH = 9 * SP + 32;
   pgag.appendChild(svgEl("rect", { x: pR - pW, y: pT, width: pW, height: pH, rx:4, fill:"#1a1a1a", stroke:"#555", "stroke-width":1.5 }));
-  // A1 dot (col 1 = rightmost in bottom view, row A = top)
   const a1 = pgaXY(0, 1);
   pgag.appendChild(svgEl("circle", { cx: a1.x, cy: pT + 8, r:3, fill:"#666" }));
   pgag.appendChild(svgText(pR - pW/2, pT - 8, "PGA2350 (bottom view)", { fontSize:11, fill:"#999" }));
-
-  // Row labels (on right side = col 1 side in bottom view)
-  for (let r = 0; r < 10; r++) {
-    pgag.appendChild(svgText(PGA_X_START + 16, PGA_Y_START + r * PGA_SPACING, PGA_ROW_LABELS[r], { fontSize:8, fill:"#666" }));
-  }
-  // Col labels (below grid, mirrored)
-  for (let c = 1; c <= 10; c++) {
-    pgag.appendChild(svgText(PGA_X_START - (c-1)*PGA_SPACING, PGA_Y_START + 9*PGA_SPACING + 16, c, { fontSize:8, fill:"#666" }));
-  }
-
+  for (let r = 0; r < 10; r++)
+    pgag.appendChild(svgText(PGA_X_START + 16, PGA_Y_START + r * SP, PGA_ROW_LABELS[r], { fontSize:8, fill:"#666" }));
+  for (let c = 1; c <= 10; c++)
+    pgag.appendChild(svgText(PGA_X_START - (c-1)*SP, PGA_Y_START + 9*SP + 16, c, { fontSize:8, fill:"#666" }));
   for (const [row, col, label] of PGA_PINS) {
     const { x, y } = pgaXY(row, col);
     const isPwr = ["GND","3V3","VBUS","3V3_EN","ADC_VRF"].includes(label);
@@ -269,23 +308,63 @@ function initSVG() {
       cx:x, cy:y, r:5, fill: isPwr ? "#4a2020" : isSys ? "#2a2a3a" : "#444",
       stroke:"#555", "stroke-width":1, id:`pga-${row}-${col}`
     }));
-    pgag.appendChild(svgText(x, y - 10, label, { fontSize:7, fill:"#777", id:`pgal-${row}-${col}` }));
+    pgag.appendChild(svgText(x, y - 10, label, { fontSize:7, fill:"#777" }));
   }
   svg.appendChild(pgag);
+
+  // ---- USB-C Breakout (4 pins in a row, above PGA) ----
+  const usbg = svgEl("g", {});
+  const ubL = USB_X_START - 12, ubT = USB_Y - 16, ubW = 3 * SP + 24, ubH = 32;
+  usbg.appendChild(svgEl("rect", { x:ubL, y:ubT, width:ubW, height:ubH, rx:3, fill:"#1a1a1a", stroke:"#555", "stroke-width":1.5 }));
+  usbg.appendChild(svgText(ubL + ubW/2, ubT - 8, "USB-C Breakout (bottom view)", { fontSize:10, fill:"#999" }));
+  for (const { label, idx } of USB_PINS) {
+    const { x, y } = usbPinXY(idx);
+    usbg.appendChild(svgEl("circle", { cx:x, cy:y, r:5, fill:"#3a2a4a", stroke:"#666", "stroke-width":1, id:`usb-${idx}` }));
+    usbg.appendChild(svgText(x, y + 12, label, { fontSize:7, fill:"#c084fc" }));
+  }
+  svg.appendChild(usbg);
+
+  // ---- Buttons (6mm x 6mm, 4-pin tactile switches) ----
+  const btng = svgEl("g", {});
+  for (const [bx, label, id] of [[BTN_RUN_X, "RUN", "run"], [BTN_BOOT_X, "BOOTSEL", "boot"]]) {
+    const by = BTN_Y;
+    // Button body
+    btng.appendChild(svgEl("rect", {
+      x: bx, y: by, width: BTN_W, height: BTN_H, rx: 3,
+      fill: "#1a1a1a", stroke: "#555", "stroke-width": 1.5
+    }));
+    // Button cap (circle in center)
+    btng.appendChild(svgEl("circle", {
+      cx: bx + BTN_W/2, cy: by + BTN_H/2, r: 10,
+      fill: "#2a2a2a", stroke: "#666", "stroke-width": 1
+    }));
+    btng.appendChild(svgText(bx + BTN_W/2, by - 8, label, { fontSize:10, fill:"#fbbf24" }));
+    // 4 pins: 2 on left (close pair), 2 on right (close pair)
+    for (let side = 0; side < 2; side++) {
+      for (let pi = 0; pi < 2; pi++) {
+        const { x, y } = btnPinXY(bx, side, pi);
+        btng.appendChild(svgEl("circle", {
+          cx: x, cy: y, r: 4, fill: "#3a3520", stroke: "#666", "stroke-width": 1,
+          id: `btn-${id}-${side}-${pi}`
+        }));
+      }
+    }
+  }
+  svg.appendChild(btng);
 
   // Wire + highlight layers
   svg.appendChild(svgEl("g", { id:"wires" }));
   svg.appendChild(svgEl("g", { id:"hilite" }));
 
   // Legend
-  const ly = 645;
-  [["Address","#60a5fa"],["Data","#34d399"],["Control","#fb923c"],["Power","#f87171"]].forEach(([l,c],i) => {
-    const lx = 80 + i * 170;
-    svg.appendChild(svgEl("line", { x1:lx, y1:ly, x2:lx+24, y2:ly, stroke:c, "stroke-width":3, "stroke-linecap":"round" }));
-    svg.appendChild(svgText(lx+36, ly, l, { fontSize:10, fill:c, anchor:"start" }));
+  const ly = 720;
+  [["Address","#60a5fa"],["Data","#34d399"],["Control","#fb923c"],
+   ["Power","#f87171"],["USB","#c084fc"],["Button","#fbbf24"]].forEach(([l,c],i) => {
+    const lx = 60 + i * 140;
+    svg.appendChild(svgEl("line", { x1:lx, y1:ly, x2:lx+20, y2:ly, stroke:c, "stroke-width":3, "stroke-linecap":"round" }));
+    svg.appendChild(svgText(lx+30, ly, l, { fontSize:9, fill:c, anchor:"start" }));
   });
-  svg.appendChild(svgText(600, 675, "VIEW FROM BOTTOM (solder side) \u2014 left/right mirrored vs. component side", { fontSize:10, fill:"#665" }));
-  svg.appendChild(svgText(600, 695, "Soldering order: Z80 pins 40, 1, 39, 2, 38, 3\u2026 alternating outside\u2011in", { fontSize:10, fill:"#554" }));
+  svg.appendChild(svgText(600, 745, "VIEW FROM BOTTOM (solder side) \u2014 left/right mirrored vs. component side", { fontSize:10, fill:"#665" }));
 }
 
 // ===== RENDER =====
@@ -296,53 +375,44 @@ function renderWires() {
   const hL = document.getElementById("hilite");
   wL.innerHTML = ""; hL.innerHTML = "";
 
-  // Reset pin visuals
+  // Reset pin fills
   for (let p = 1; p <= 40; p++) {
     const el = document.getElementById(`z80-${p}`);
-    if (el) { el.setAttribute("fill", wiredZ80Pins.has(p) ? "#444" : "#2a2a2a"); el.setAttribute("r", "5"); }
+    if (el) { el.setAttribute("fill", wiredZ80Pins.has(p) ? "#444" : "#2a2a2a"); el.setAttribute("r","5"); }
   }
   for (const [r,c] of PGA_PINS) {
     const el = document.getElementById(`pga-${r}-${c}`);
-    if (el) { el.setAttribute("fill", "#444"); el.setAttribute("r", "5"); }
+    if (el) { el.setAttribute("fill","#444"); el.setAttribute("r","5"); }
+  }
+  for (let i = 0; i < 4; i++) {
+    const el = document.getElementById(`usb-${i}`);
+    if (el) { el.setAttribute("fill","#3a2a4a"); el.setAttribute("r","5"); }
   }
 
   allWires.forEach((wire, i) => {
     if (i > currentIndex) return;
-    const z = z80XY(wire.z80pin);
-    const p = pgaXY(wire.row, wire.col);
+    const s = wire.srcXY();
+    const d = wire.dstXY();
     const color = GROUP_COLORS[wire.group];
     const isCur = i === currentIndex;
 
-    // Bezier with slight fan-out
-    const mx = (z.x + p.x) / 2, my = (z.y + p.y) / 2;
-    const oy = ((i % 7) - 3) * 8;
+    const mx = (s.x + d.x) / 2, my = (s.y + d.y) / 2;
+    const oy = ((i % 9) - 4) * 7;
     wL.appendChild(svgEl("path", {
-      d: `M${z.x},${z.y} Q${mx},${my+oy} ${p.x},${p.y}`,
+      d: `M${s.x},${s.y} Q${mx},${my+oy} ${d.x},${d.y}`,
       fill:"none", stroke:color, "stroke-width": isCur ? 3 : 1.5,
       "stroke-linecap":"round", opacity: isCur ? 1 : 0.25,
     }));
 
     if (isCur) {
-      // Highlight endpoints
-      for (const pt of [z, p]) {
+      for (const pt of [s, d]) {
         hL.appendChild(svgEl("circle", { cx:pt.x, cy:pt.y, r:10, fill:color, opacity:0.2 }));
         hL.appendChild(svgEl("circle", { cx:pt.x, cy:pt.y, r:6, fill:color, opacity:0.9 }));
       }
-      // Z80 label
-      const zSide = wire.z80pin <= 20 ? 1 : -1;
-      hL.appendChild(svgText(z.x + zSide * 55, z.y, `pin ${wire.z80pin}: ${wire.signal}`, {
-        fontSize:11, fill:color, fontWeight:"bold", anchor: zSide > 0 ? "start" : "end"
-      }));
-      // PGA label
-      const pgaGrid = PGA_ROW_LABELS[wire.row] + wire.col;
-      hL.appendChild(svgText(p.x, p.y - 18, `${pgaGrid} (${wire.gpio})`, {
-        fontSize:11, fill:color, fontWeight:"bold"
-      }));
-      // Color the pins
-      const ze = document.getElementById(`z80-${wire.z80pin}`);
-      if (ze) { ze.setAttribute("fill", color); ze.setAttribute("r", "6"); }
-      const pe = document.getElementById(`pga-${wire.row}-${wire.col}`);
-      if (pe) { pe.setAttribute("fill", color); pe.setAttribute("r", "6"); }
+      // Source label
+      hL.appendChild(svgText(s.x, s.y - 16, wire.fromLabel(), { fontSize:10, fill:color, fontWeight:"bold" }));
+      // Dest label
+      hL.appendChild(svgText(d.x, d.y - 16, wire.toLabel(), { fontSize:10, fill:color, fontWeight:"bold" }));
     }
   });
   updateUI();
@@ -359,14 +429,13 @@ function updateUI() {
     wc.textContent = `${TOTAL} wires \u2014 press Next to begin`;
     document.getElementById("info-signal").textContent = "--";
     document.getElementById("info-signal").style.color = "#aaa";
-    document.getElementById("info-z80").textContent = "--";
-    document.getElementById("info-pga").textContent = "--";
-    document.getElementById("info-gpio").textContent = "--";
+    document.getElementById("info-from").textContent = "--";
+    document.getElementById("info-to").textContent = "--";
+    document.getElementById("info-gpio").textContent = "";
     return;
   }
   const w = allWires[currentIndex];
   const color = GROUP_COLORS[w.group];
-  const pgaGrid = PGA_ROW_LABELS[w.row] + w.col;
 
   gl.textContent = GROUP_NAMES[w.group];
   gl.style.background = color + "22"; gl.style.color = color;
@@ -374,9 +443,9 @@ function updateUI() {
 
   document.getElementById("info-signal").textContent = w.signal;
   document.getElementById("info-signal").style.color = color;
-  document.getElementById("info-z80").textContent = `Pin ${w.z80pin} (${w.z80pin <= 20 ? "right col" : "left col"} in bottom view)`;
-  document.getElementById("info-pga").textContent = `${pgaGrid} (row ${PGA_ROW_LABELS[w.row]}, col ${w.col})`;
-  document.getElementById("info-gpio").textContent = w.gpio;
+  document.getElementById("info-from").textContent = w.fromLabel();
+  document.getElementById("info-to").textContent = w.toLabel();
+  document.getElementById("info-gpio").textContent = w.gpio || "";
 }
 
 function navigate(delta) {
