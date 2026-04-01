@@ -30,8 +30,9 @@ CYCLE_MEM_READ = 1
 CYCLE_MEM_WRITE = 2
 CYCLE_IO_READ = 3
 CYCLE_IO_WRITE = 4
+CYCLE_INT_ACK = 5
 
-CYCLE_NAMES = ("FETCH", "MREAD", "MWRIT", "IOREAD", "IOWRIT")
+CYCLE_NAMES = ("FETCH", "MREAD", "MWRIT", "IOREAD", "IOWRIT", "INTACK")
 PACKET_SIZE = 4
 
 
@@ -58,6 +59,9 @@ class InstructionAssembler:
 
     def __init__(self):
         self._reset()
+        # Interrupt state — set by feed(), read and cleared by caller
+        self.int_ack = None    # (addr, vector) when INT acknowledge detected
+        self.nmi_detected = False  # True when NMI detected
 
     def _reset(self):
         self._state = "IDLE"
@@ -75,9 +79,17 @@ class InstructionAssembler:
         self._raw_bytes = []
 
     def feed(self, cycle_type, addr, value):
-        """Feed a bus cycle.  Returns an Instruction when one is complete."""
+        """Feed a bus cycle.  Returns an Instruction when one is complete.
+
+        After calling feed(), check:
+          - self.int_ack: set to (addr, vector) if INT acknowledge was seen
+          - self.nmi_detected: set to True if NMI was detected
+        Caller should clear these after handling.
+        """
         if cycle_type == CYCLE_OPCODE_FETCH:
             return self._on_opcode_fetch(addr, value)
+        if cycle_type == CYCLE_INT_ACK:
+            return self._on_int_ack(addr, value)
         if cycle_type == CYCLE_MEM_READ:
             return self._on_mem_read(addr, value)
         if cycle_type == CYCLE_MEM_WRITE:
@@ -88,6 +100,15 @@ class InstructionAssembler:
         if cycle_type == CYCLE_IO_WRITE:
             self._io_writes.append((addr, value))
             return None
+        return None
+
+    def _on_int_ack(self, addr, value):
+        """Handle INT acknowledge cycle.  Finalizes current instruction."""
+        self.int_ack = (addr, value)
+        if self._state != "IDLE":
+            result = self._finalize()
+            self._reset()
+            return result
         return None
 
     def _on_opcode_fetch(self, addr, value):
@@ -141,6 +162,15 @@ class InstructionAssembler:
 
         # In COLLECTING_OPS or COLLECTING_DATA, a new opcode fetch means
         # the previous instruction is done.
+
+        # NMI detection: if the new fetch is at 0x0066 and the current
+        # instruction shouldn't branch there, the last 2 data_writes are
+        # the NMI's stack push — strip them from the instruction.
+        if addr == 0x0066:
+            if len(self._data_writes) >= 2:
+                self._data_writes = self._data_writes[:-2]
+            self.nmi_detected = True
+
         result = self._finalize()
         self._reset()
         new = self._start_new(addr, value)
@@ -148,6 +178,13 @@ class InstructionAssembler:
         return result if result else new
 
     def _start_new(self, addr, value):
+        # Clear any stray bus cycles from between instructions
+        # (e.g., INT dispatch stack writes accumulated while IDLE)
+        self._data_reads = []
+        self._data_writes = []
+        self._io_reads = []
+        self._io_writes = []
+
         self._pc = addr
         self._raw_bytes = [value]
 
@@ -260,21 +297,6 @@ def format_instruction(instr, reg_changes):
     return f"{addr_str}: {raw} {mnem} {comment}"
 
 
-# -- Interrupt detection --
-
-# Effect types that can cause a PC discontinuity (not an interrupt)
-_BRANCH_EFFECTS = frozenset({
-    "jp", "jr", "call", "ret", "rst", "reti", "retn", "djnz", "halt",
-    "jp_hl", "jp_ix",
-    "block_ld", "block_cp", "in_block", "out_block",  # LDIR etc. repeat at same PC
-    "unknown",
-})
-
-def _is_branch(instr):
-    """True if this instruction can change PC non-sequentially."""
-    return instr.effect[0] in _BRANCH_EFFECTS
-
-
 # -- Main trace loop --
 
 def run_trace(source: BinaryIO, raw_output=False, is_file=False,
@@ -285,7 +307,6 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
     trace_filter = (TraceFilter(filter_config, format_instruction)
                     if filter_config and filter_config.has_any_config else None)
     instr_count = 0
-    prev_instr = None
 
     buf = bytearray()
 
@@ -317,6 +338,16 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                     print(f"  {ct_name:6s} {addr:04X} {value:02X}")
 
                 instr = assembler.feed(cycle_type, addr, value)
+
+                # Check for interrupt markers (set by assembler)
+                if assembler.int_ack:
+                    iaddr, ivec = assembler.int_ack
+                    assembler.int_ack = None
+                    print(f"; --- INT acknowledge at ${iaddr:04X}, vector=${ivec:02X} ---")
+                if assembler.nmi_detected:
+                    assembler.nmi_detected = False
+                    print(f"; --- NMI ---")
+
                 if instr is None:
                     continue
 
@@ -325,18 +356,10 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 state.execute(instr)
                 instr_count += 1
 
-                # Interrupt detection: unexpected PC discontinuity
-                if prev_instr is not None:
-                    expected_pc = (prev_instr.pc + prev_instr.length) & 0xFFFF
-                    if instr.pc != expected_pc and not _is_branch(prev_instr):
-                        print(f"; --- IRQ: {prev_instr.pc + prev_instr.length:04X} -> {instr.pc:04X} ---")
-
                 # Loop detection
                 state_key = state.snapshot_key()
                 loop_action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
                 reg_changes = state.format_changed(prev_snap)
-
-                prev_instr = instr
 
                 if trace_filter:
                     result = trace_filter.evaluate(instr, reg_changes, loop_action)

@@ -14,6 +14,7 @@ static const char *cycle_name(cycle_type_t ct) {
         case CYCLE_MEM_WRITE:    return "MWRIT";
         case CYCLE_IO_READ:      return "IORD ";
         case CYCLE_IO_WRITE:     return "IOWR ";
+        case CYCLE_INT_ACK:      return "IACK ";
         default:                 return "???? ";
     }
 }

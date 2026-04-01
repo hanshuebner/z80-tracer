@@ -66,6 +66,7 @@ typedef enum {
     CYCLE_MEM_WRITE,      // /M1=1, /MREQ=0, /WR=0
     CYCLE_IO_READ,        // /IORQ=0, /RD=0
     CYCLE_IO_WRITE,       // /IORQ=0, /WR=0
+    CYCLE_INT_ACK,        // /M1=0, /IORQ=0, /RD=0 (maskable interrupt acknowledge)
     CYCLE_UNKNOWN
 } cycle_type_t;
 
@@ -78,6 +79,7 @@ static inline cycle_type_t classify_sample(uint32_t sample) {
     int wr   = !(sample & SAMPLE_WR_BIT);
 
     if (m1 && mreq && rd)  return CYCLE_OPCODE_FETCH;
+    if (m1 && iorq && rd)  return CYCLE_INT_ACK;   // INT acknowledge: M1+IORQ, no MREQ
     if (mreq && rd)        return CYCLE_MEM_READ;
     if (mreq && wr)        return CYCLE_MEM_WRITE;
     if (iorq && rd)        return CYCLE_IO_READ;
