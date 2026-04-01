@@ -55,12 +55,12 @@ const PGA_ROW_LABELS = "ABCDEFGHIJ";
 
 // All populated PGA pins: [row_index, col, label]
 const PGA_PINS = [
-  // Row A (top)
+  // Row A (top) — A1 and A10 are GND
   [0,1,"GND"],[0,2,"GP1"],[0,3,"VBUS"],[0,4,"3V3_EN"],[0,5,"RUN"],
-  [0,6,"USB_DP"],[0,7,"USB_DM"],[0,8,"BOOTSEL"],[0,9,"GP46"],
-  // Row B
-  [1,1,"GP2"],[1,3,"GP0"],[1,4,"3V3"],[1,5,"ADC_VRF"],
-  [1,6,"SWCLK"],[1,7,"SWDIO"],[1,8,"GP47"],[1,10,"GP45"],
+  [0,6,"USB_DP"],[0,7,"USB_DM"],[0,8,"BOOTSEL"],[0,9,"GP46"],[0,10,"GND"],
+  // Row B — B2 and B9 are GND
+  [1,1,"GP2"],[1,2,"GND"],[1,3,"GP0"],[1,4,"3V3"],[1,5,"ADC_VRF"],
+  [1,6,"SWCLK"],[1,7,"SWDIO"],[1,8,"GP47"],[1,9,"GND"],[1,10,"GP45"],
   // Rows C-H: only columns 1,2 (left) and 9,10 (right)
   [2,1,"GP4"],[2,2,"GP3"],   [2,9,"GP43"],[2,10,"GP44"],
   [3,1,"GP6"],[3,2,"GP5"],   [3,9,"GP42"],[3,10,"GP41"],
@@ -73,8 +73,9 @@ const PGA_PINS = [
   [8,5,"GP22"],[8,6,"GP25"],[8,7,"GP27"],[8,8,"GP28"],
   [8,9,"GP31"],[8,10,"GP32"],
   // Row J (outer bottom, no J1 or J10)
-  [9,2,"GP17"],[9,3,"GP18"],[9,4,"GP19"],[9,5,"GP23"],
-  [9,6,"GP24"],[9,7,"GP26"],[9,8,"GP29"],[9,9,"GP30"],
+  // Row J — J1 and J10 are GND
+  [9,1,"GND"],[9,2,"GP17"],[9,3,"GP18"],[9,4,"GP19"],[9,5,"GP23"],
+  [9,6,"GP24"],[9,7,"GP26"],[9,8,"GP29"],[9,9,"GP30"],[9,10,"GND"],
 ];
 
 // ===== WIRE DEFINITIONS (all connections) =====
