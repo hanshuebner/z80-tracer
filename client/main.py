@@ -416,10 +416,42 @@ def main():
             ser.close()
         return
 
-    print(f"Connected to {args.port} -- Ctrl+C to stop")
+    print(f"Connected to {args.port}")
+
+    # Drain any stale data
+    ser.reset_input_buffer()
+
+    # Send trace command and wait for acknowledgement
+    ser.write(b"trace\n")
+    ser.flush()
+    while True:
+        line = ser.readline()
+        if not line:
+            continue
+        line = line.strip()
+        if line == b"tracing":
+            break
+        if line:
+            print(f"Firmware: {line.decode(errors='replace')}")
+
+    print("Tracing -- Ctrl+C to stop")
     try:
         run_trace(ser, raw_output=args.raw, detect_loops=args.loops)
+    except KeyboardInterrupt:
+        pass
     finally:
+        # Send stop command
+        try:
+            ser.write(b"q")
+            ser.flush()
+            # Read until we see "stopped"
+            for _ in range(20):
+                line = ser.readline()
+                if line and b"stopped" in line:
+                    print("Stopped.")
+                    break
+        except Exception:
+            pass
         ser.close()
 
 

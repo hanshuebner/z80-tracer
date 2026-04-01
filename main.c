@@ -52,9 +52,11 @@ static void gpio_setup(void) {
 static PIO pio = pio0;
 static uint sm_read;
 static uint sm_write;
+static uint offset_rd;
+static uint offset_wr;
 
 static void pio_setup(void) {
-    uint offset_rd = pio_add_program(pio, &z80_read_capture_program);
+    offset_rd = pio_add_program(pio, &z80_read_capture_program);
     sm_read = pio_claim_unused_sm(pio, true);
     pio_sm_config cfg_rd = z80_read_capture_program_get_default_config(offset_rd);
     sm_config_set_in_pins(&cfg_rd, PIN_IN_BASE);
@@ -62,7 +64,7 @@ static void pio_setup(void) {
     sm_config_set_in_shift(&cfg_rd, false, false, 31);
     pio_sm_init(pio, sm_read, offset_rd, &cfg_rd);
 
-    uint offset_wr = pio_add_program(pio, &z80_write_capture_program);
+    offset_wr = pio_add_program(pio, &z80_write_capture_program);
     sm_write = pio_claim_unused_sm(pio, true);
     pio_sm_config cfg_wr = z80_write_capture_program_get_default_config(offset_wr);
     sm_config_set_in_pins(&cfg_wr, PIN_IN_BASE);
@@ -119,9 +121,7 @@ static void flow_control_update(uint32_t total_pending) {
 }
 
 // ---- USB output ----
-// Uses TinyUSB CDC directly — all on core 0, no thread safety issues.
 
-// Try to write one sample. Returns false if USB has no room.
 static bool emit_sample(uint32_t sample) {
     cycle_type_t ct = classify_sample(sample);
     if (ct == CYCLE_UNKNOWN) return true;
@@ -141,57 +141,153 @@ static bool emit_sample(uint32_t sample) {
     return true;
 }
 
+// ---- USB text I/O for command mode ----
+
+static void usb_puts(const char *s) {
+    tud_cdc_write_str(s);
+    tud_cdc_write_flush();
+}
+
+// ---- Capture start/stop ----
+
+static void capture_start(void) {
+    // Reset ring buffer tails
+    read_buf_tail = 0;
+    write_buf_tail = 0;
+
+    // Re-init DMA write pointers to buffer start
+    dma_channel_set_write_addr(dma_chan_read, read_buf, false);
+    dma_channel_set_write_addr(dma_chan_write, write_buf, false);
+    dma_channel_set_trans_count(dma_chan_read, 0xFFFFFFFF, false);
+    dma_channel_set_trans_count(dma_chan_write, 0xFFFFFFFF, false);
+
+    // Clear PIO FIFOs
+    pio_sm_clear_fifos(pio, sm_read);
+    pio_sm_clear_fifos(pio, sm_write);
+
+    // Restart PIO state machines from the beginning
+    pio_sm_restart(pio, sm_read);
+    pio_sm_restart(pio, sm_write);
+    pio_sm_exec(pio, sm_read, pio_encode_jmp(offset_rd));
+    pio_sm_exec(pio, sm_write, pio_encode_jmp(offset_wr));
+
+    // Start DMA, then enable PIO
+    dma_channel_start(dma_chan_read);
+    dma_channel_start(dma_chan_write);
+    pio_sm_set_enabled(pio, sm_read, true);
+    pio_sm_set_enabled(pio, sm_write, true);
+}
+
+static void capture_stop(void) {
+    // Stop PIO state machines
+    pio_sm_set_enabled(pio, sm_read, false);
+    pio_sm_set_enabled(pio, sm_write, false);
+
+    // Abort DMA
+    dma_channel_abort(dma_chan_read);
+    dma_channel_abort(dma_chan_write);
+
+    // Release /WAIT if asserted
+    if (wait_asserted) {
+        gpio_put(PIN_WAIT, 1);
+        wait_asserted = false;
+    }
+}
+
 // ---- Entry point ----
 
 int main(void) {
-    // Init stdio_usb so pico-sdk configures TinyUSB CDC.
-    // We call tud_* directly for data output but need the stack initialized.
     stdio_init_all();
 
-    // Release /WAIT immediately so Z80 runs during USB enumeration
+    // Release /WAIT so Z80 runs during USB enumeration
     gpio_init(PIN_WAIT);
     gpio_set_dir(PIN_WAIT, GPIO_OUT);
     gpio_put(PIN_WAIT, 1);
-
-    // Wait for USB connection
-    while (!tud_cdc_connected())
-        tud_task();
 
     gpio_setup();
     pio_setup();
     dma_setup();
 
-    dma_channel_start(dma_chan_read);
-    dma_channel_start(dma_chan_write);
-    pio_sm_set_enabled(pio, sm_read, true);
-    pio_sm_set_enabled(pio, sm_write, true);
+    // Command buffer
+    char cmd_buf[32];
+    int cmd_len = 0;
+    bool tracing = false;
 
     while (true) {
-        tud_task();  // service USB on this core
+        tud_task();
 
-        // Flow control: check fill level before draining
-        uint32_t rd_pending = ring_available(
-            dma_write_index(dma_chan_read, read_buf), read_buf_tail);
-        uint32_t wr_pending = ring_available(
-            dma_write_index(dma_chan_write, write_buf), write_buf_tail);
-        flow_control_update(rd_pending + wr_pending);
-
-        // Drain read buffer — stop when USB is full
-        uint32_t rd_head = dma_write_index(dma_chan_read, read_buf);
-        while (read_buf_tail != rd_head) {
-            if (!emit_sample(read_buf[read_buf_tail]))
-                break;
-            read_buf_tail = (read_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+        if (!tud_cdc_connected()) {
+            if (tracing) {
+                capture_stop();
+                tracing = false;
+            }
+            cmd_len = 0;
+            continue;
         }
 
-        // Drain write buffer — stop when USB is full
-        uint32_t wr_head = dma_write_index(dma_chan_write, write_buf);
-        while (write_buf_tail != wr_head) {
-            if (!emit_sample(write_buf[write_buf_tail]))
-                break;
-            write_buf_tail = (write_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
-        }
+        if (tracing) {
+            // Check for stop: any incoming byte stops tracing
+            if (tud_cdc_available()) {
+                // Drain all incoming bytes
+                uint8_t dummy[64];
+                tud_cdc_read(dummy, sizeof(dummy));
 
-        tud_cdc_write_flush();
+                capture_stop();
+                tracing = false;
+
+                // Flush remaining buffered trace data
+                tud_cdc_write_flush();
+                usb_puts("stopped\r\n");
+                continue;
+            }
+
+            // Flow control
+            uint32_t rd_pending = ring_available(
+                dma_write_index(dma_chan_read, read_buf), read_buf_tail);
+            uint32_t wr_pending = ring_available(
+                dma_write_index(dma_chan_write, write_buf), write_buf_tail);
+            flow_control_update(rd_pending + wr_pending);
+
+            // Drain read buffer
+            uint32_t rd_head = dma_write_index(dma_chan_read, read_buf);
+            while (read_buf_tail != rd_head) {
+                if (!emit_sample(read_buf[read_buf_tail]))
+                    break;
+                read_buf_tail = (read_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+            }
+
+            // Drain write buffer
+            uint32_t wr_head = dma_write_index(dma_chan_write, write_buf);
+            while (write_buf_tail != wr_head) {
+                if (!emit_sample(write_buf[write_buf_tail]))
+                    break;
+                write_buf_tail = (write_buf_tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+            }
+
+            tud_cdc_write_flush();
+
+        } else {
+            // Command mode: read characters, look for commands
+            while (tud_cdc_available()) {
+                uint8_t ch;
+                tud_cdc_read(&ch, 1);
+
+                if (ch == '\r' || ch == '\n') {
+                    if (cmd_len > 0) {
+                        cmd_buf[cmd_len] = '\0';
+                        if (strcmp(cmd_buf, "trace") == 0) {
+                            usb_puts("tracing\r\n");
+                            capture_start();
+                            tracing = true;
+                        } else {
+                            usb_puts("error: unknown command\r\n");
+                        }
+                        cmd_len = 0;
+                    }
+                } else if (cmd_len < (int)sizeof(cmd_buf) - 1) {
+                    cmd_buf[cmd_len++] = ch;
+                }
+            }
+        }
     }
 }
