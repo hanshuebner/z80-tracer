@@ -25,10 +25,11 @@
 .program z80_read_capture
 
 .wrap_target
+wait_rd:
     wait 1 gpio 27          ; ensure /RD is high (idle)
     wait 0 gpio 27          ; /RD just went low - read cycle starting
     jmp pin valid_read       ; jmp_pin = /RFSH: if HIGH -> real cycle
-    jmp wrap_target          ; /RFSH low -> DRAM refresh, skip it
+    jmp wait_rd              ; /RFSH low -> DRAM refresh, skip it
 valid_read:
     wait 1 gpio 30          ; wait for CLK to go high
     wait 0 gpio 30          ; CLK falling edge = data valid on bus

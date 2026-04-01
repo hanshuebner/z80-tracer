@@ -5,7 +5,6 @@
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
-#include "tusb.h"
 
 #include "z80_trace.h"
 #include "z80_trace.pio.h"
@@ -40,7 +39,8 @@ static void gpio_setup(void) {
     }
     // Control signals: inputs
     int ctrl_pins[] = { PIN_M1, PIN_MREQ, PIN_IORQ, PIN_RD, PIN_WR,
-                        PIN_RFSH, PIN_CLK, PIN_HALT };
+                        PIN_RFSH, PIN_CLK, PIN_HALT,
+                        PIN_INT, PIN_NMI, PIN_RESET };
     for (int i = 0; i < (int)(sizeof(ctrl_pins)/sizeof(ctrl_pins[0])); i++) {
         gpio_init(ctrl_pins[i]);
         gpio_set_dir(ctrl_pins[i], GPIO_IN);
@@ -139,12 +139,8 @@ static void flow_control_update(uint32_t total_pending) {
 }
 
 // ---- USB output (runs on core 1) ----
-
-// Output format: binary stream of 4-byte packets
-//   byte 0: cycle_type_t
-//   byte 1: address low
-//   byte 2: address high
-//   byte 3: data
+// Uses pico-sdk stdio_usb (CDC).  Output is raw binary: 4-byte packets
+// sent via putchar_raw() which bypasses newline translation.
 
 static void emit_sample(uint32_t sample) {
     cycle_type_t ct = classify_sample(sample);
@@ -156,11 +152,9 @@ static void emit_sample(uint32_t sample) {
     pkt[2] = sample_addr(sample) >> 8;
     pkt[3] = sample_data(sample);
 
-    // Block until CDC is writable (with /WAIT keeping Z80 paused if needed)
-    while (!tud_cdc_write_available()) {
-        tud_task();
+    for (int i = 0; i < USB_PACKET_SIZE; i++) {
+        putchar_raw(pkt[i]);
     }
-    tud_cdc_write(pkt, USB_PACKET_SIZE);
 }
 
 static void core1_main(void) {
@@ -180,8 +174,7 @@ static void core1_main(void) {
         }
 
         // Flush USB
-        tud_cdc_write_flush();
-        tud_task();
+        stdio_flush();
 
         // Update flow control based on total pending data
         uint32_t total_pending = ring_available(rd_head, read_buf_tail)
@@ -194,7 +187,6 @@ static void core1_main(void) {
 
 int main(void) {
     stdio_init_all();
-    tusb_init();
 
     gpio_setup();
     pio_setup();
@@ -211,8 +203,8 @@ int main(void) {
     pio_sm_set_enabled(pio, sm_read, true);
     pio_sm_set_enabled(pio, sm_write, true);
 
-    // Core 0: just service USB device stack
+    // Core 0: idle (stdio_usb services USB in the background)
     while (true) {
-        tud_task();
+        tight_loop_contents();
     }
 }

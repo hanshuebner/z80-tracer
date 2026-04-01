@@ -24,8 +24,6 @@ target_link_libraries(z80_tracer
     hardware_pio
     hardware_dma
     hardware_gpio
-    tinyusb_device
-    tinyusb_board
 )
 
 # Use USB for stdio (CDC)
