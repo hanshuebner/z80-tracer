@@ -57,9 +57,9 @@ Row G │ GP12   GP11   ---    ---    ---    ---    ---    ---    GP35   GP36
       │
 Row H │ GP14   GP13   ---    ---    ---    ---    ---    ---    GP33   GP34
       │
-Row I │ GP16   GP15   GP20   GP21   GP23   GP25   GP27   GP29   GP31   GP32
+Row I │ GP16   GP15   GP19   GP21   GP23   GP25   GP27   GP29   GP31   GP32
       │
-Row J │ GND    GP17   GP18   GP19   GP22   GP24   GP26   GP28   GP30    GND
+Row J │ GND    GP17   GP18   GP20   GP22   GP24   GP26   GP28   GP30    GND
 ```
 
 Note: "---" = no pin (interior is empty, chip sits there). "BOOTSL" = BOOTSEL.
@@ -77,8 +77,8 @@ GPIO  Grid     GPIO  Grid     GPIO  Grid     GPIO  Grid
  4    C1        16   I1        28   J8        40   E10
  5    D2        17   J2        29   I8        41   D9
  6    D1        18   J3        30   J9        42   D10
- 7    E2        19   J4        31   I9        43   C9
- 8    E1        20   I3        32   I10       44   C10
+ 7    E2        19   I3        31   I9        43   C9
+ 8    E1        20   J4        32   I10       44   C10
  9    F2        21   I4        33   H9        45   B10
 10    F1        22   J5        34   H10       46   A9
 11    G2        23   I5        35   G9        47   B8
@@ -129,8 +129,8 @@ The table below is sorted by Z80 pin number for reference.
   4   A14       GP14    H1     Row H, leftmost
   5   A15       GP15    I2     Row I, 2nd from left edge
   6   CLK       GP30    J9     Row J (bottom), 9th from left
-  7   D4        GP20    I3     Row I, 3rd from left
-  8   D3        GP19    J4     Row J, 4th from left
+  7   D4        GP20    J4     Row J, 4th from left
+  8   D3        GP19    I3     Row I, 3rd from left
   9   D5        GP21    I4     Row I, 4th from left
  10   D6        GP22    J5     Row J, 5th from left
  12   D2        GP18    J3     Row J, 3rd from left

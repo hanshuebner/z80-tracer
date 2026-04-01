@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/gpio.h"
@@ -15,6 +16,18 @@ static const char *cycle_name(cycle_type_t ct) {
         case CYCLE_IO_WRITE:     return "IOWR ";
         default:                 return "???? ";
     }
+}
+
+static void decode_ctrl(uint32_t sample, char *buf, int buflen) {
+    // Show signal names when ACTIVE (active-low: bit=0 means asserted)
+    buf[0] = '\0';
+    if (!(sample & SAMPLE_M1_BIT))   strncat(buf, "M1 ", buflen - strlen(buf) - 1);
+    if (!(sample & SAMPLE_MREQ_BIT)) strncat(buf, "MREQ ", buflen - strlen(buf) - 1);
+    if (!(sample & SAMPLE_IORQ_BIT)) strncat(buf, "IORQ ", buflen - strlen(buf) - 1);
+    if (!(sample & SAMPLE_RD_BIT))   strncat(buf, "RD ", buflen - strlen(buf) - 1);
+    if (!(sample & SAMPLE_WR_BIT))   strncat(buf, "WR ", buflen - strlen(buf) - 1);
+    if (!(sample & SAMPLE_RFSH_BIT)) strncat(buf, "RFSH ", buflen - strlen(buf) - 1);
+    if (sample & SAMPLE_CLK_BIT)     strncat(buf, "CLK ", buflen - strlen(buf) - 1);
 }
 
 static void gpio_setup(void) {
@@ -99,18 +112,19 @@ int main(void) {
 
     uint32_t count = 0;
     while (true) {
+        char ctrl[64];
+
         // Poll read SM FIFO
         while (!pio_sm_is_rx_fifo_empty(pio, sm_read)) {
             uint32_t sample = pio_sm_get(pio, sm_read);
             cycle_type_t ct = classify_sample(sample);
-            printf("RD %s  %04X   %02X  [%08lX]",
+            decode_ctrl(sample, ctrl, sizeof(ctrl));
+            printf("RD %s  %04X   %02X  [%08lX]  %s\n",
                    cycle_name(ct),
                    sample_addr(sample),
                    sample_data(sample),
-                   (unsigned long)sample);
-            if (ct == CYCLE_OPCODE_FETCH)
-                printf("  *");
-            printf("\n");
+                   (unsigned long)sample,
+                   ctrl);
             count++;
         }
 
@@ -118,11 +132,13 @@ int main(void) {
         while (!pio_sm_is_rx_fifo_empty(pio, sm_write)) {
             uint32_t sample = pio_sm_get(pio, sm_write);
             cycle_type_t ct = classify_sample(sample);
-            printf("WR %s  %04X   %02X  [%08lX]\n",
+            decode_ctrl(sample, ctrl, sizeof(ctrl));
+            printf("WR %s  %04X   %02X  [%08lX]  %s\n",
                    cycle_name(ct),
                    sample_addr(sample),
                    sample_data(sample),
-                   (unsigned long)sample);
+                   (unsigned long)sample,
+                   ctrl);
             count++;
         }
 
