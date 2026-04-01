@@ -261,7 +261,7 @@ def format_instruction(instr, reg_changes):
 
 # -- Main trace loop --
 
-def run_trace(source: BinaryIO, raw_output=False, is_file=False):
+def run_trace(source: BinaryIO, raw_output=False, is_file=False, detect_loops=True):
     assembler = InstructionAssembler()
     state = Z80State()
     loop_det = LoopDetector()
@@ -280,11 +280,13 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False):
 
             buf.extend(chunk)
 
-            # Sync: skip bytes until we find one with bit 7 set (packet start)
-            while buf and not (buf[0] & 0x80):
-                buf = buf[1:]
-
             while len(buf) >= PACKET_SIZE:
+                # Sync: skip bytes until we find one with bit 7 set (packet start)
+                while buf and not (buf[0] & 0x80):
+                    buf = buf[1:]
+                if len(buf) < PACKET_SIZE:
+                    break
+
                 pkt = buf[:PACKET_SIZE]
                 buf = buf[PACKET_SIZE:]
 
@@ -305,7 +307,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False):
 
                 # Loop detection
                 state_key = state.snapshot_key()
-                action = loop_det.check(instr.pc, state_key)
+                action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
 
                 if action == "normal":
                     reg_changes = state.format_changed(prev_snap)
@@ -333,7 +335,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False):
         state.execute(instr)
         instr_count += 1
         state_key = state.snapshot_key()
-        action = loop_det.check(instr.pc, state_key)
+        action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
         reg_changes = state.format_changed(prev_snap)
         if action == "loop_exit":
             summary = loop_det.loop_summary()
@@ -368,11 +370,18 @@ def main():
     parser.add_argument(
         "--raw", action="store_true",
         help="Also print raw bus cycles")
+    parser.add_argument(
+        "--loops", action="store_true",
+        help="Enable loop detection (suppress repeated sequences)")
+    parser.add_argument(
+        "--hexdump", action="store_true",
+        help="Dump raw USB bytes in hex and exit (diagnostic)")
     args = parser.parse_args()
 
     if args.replay:
         with open(args.replay, "rb") as f:
-            run_trace(f, raw_output=args.raw, is_file=True)
+            run_trace(f, raw_output=args.raw, is_file=True,
+                      detect_loops=args.loops)
         return
 
     if not args.port:
@@ -385,9 +394,31 @@ def main():
         sys.exit(1)
 
     ser = serial.Serial(args.port, args.baud, timeout=0.1)
+
+    if args.hexdump:
+        print(f"Hex dump from {args.port} -- Ctrl+C to stop")
+        offset = 0
+        try:
+            while True:
+                chunk = ser.read(4096)
+                if not chunk:
+                    continue
+                for i in range(0, len(chunk), 16):
+                    row = chunk[i:i+16]
+                    hex_part = " ".join(f"{b:02X}" for b in row)
+                    # Mark packet starts (bit 7 set) with '>' prefix
+                    ann = "".join(">" if b & 0x80 else " " for b in row)
+                    print(f"{offset+i:06X}: {hex_part:<48s}  {ann}")
+                offset += len(chunk)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            ser.close()
+        return
+
     print(f"Connected to {args.port} -- Ctrl+C to stop")
     try:
-        run_trace(ser, raw_output=args.raw)
+        run_trace(ser, raw_output=args.raw, detect_loops=args.loops)
     finally:
         ser.close()
 
