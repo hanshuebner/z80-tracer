@@ -96,9 +96,10 @@ static inline uint8_t sample_data(uint32_t sample) {
 // --- Ring buffer for DMA capture ---
 // Must be power-of-2 sized and aligned for DMA ring mode.
 // DMA RING_SIZE field is 4 bits, max 15 -> max ring is 2^15 = 32KB.
-#define CAPTURE_BUF_SIZE_WORDS  (8 * 1024)   // 8K entries = 32KB
-#define CAPTURE_BUF_SIZE_BYTES  (CAPTURE_BUF_SIZE_WORDS * sizeof(uint32_t))
-#define CAPTURE_BUF_RING_BITS   15            // log2(32KB) = 15
+// Configure via CAPTURE_BUF_RING_BITS (log2 of buffer size in bytes).
+#define CAPTURE_BUF_RING_BITS   15            // log2(32KB) = 15 — max DMA ring size
+#define CAPTURE_BUF_SIZE_BYTES  (1u << CAPTURE_BUF_RING_BITS)
+#define CAPTURE_BUF_SIZE_WORDS  (CAPTURE_BUF_SIZE_BYTES / sizeof(uint32_t))
 
 // USB CDC output packet format (binary, 4 bytes with bit-7 sync):
 //   Byte 0:  1TTTT_AAA   bit7=1 (sync), bits 6-3 = cycle_type, bits 2-0 = addr[15:13]

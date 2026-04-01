@@ -21,13 +21,12 @@ target_include_directories(z80_tracer PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
 target_link_libraries(z80_tracer
     pico_stdlib
-    pico_multicore
     hardware_pio
     hardware_dma
     hardware_gpio
 )
 
-# Use USB for stdio (CDC)
+# Enable stdio USB so pico-sdk configures TinyUSB CDC for us
 pico_enable_stdio_usb(z80_tracer 1)
 pico_enable_stdio_uart(z80_tracer 0)
 
@@ -45,3 +44,14 @@ target_link_libraries(test_raw
 pico_enable_stdio_usb(test_raw 1)
 pico_enable_stdio_uart(test_raw 0)
 pico_add_extra_outputs(test_raw)
+
+# --- Test firmware: /WAIT toggle ---
+add_executable(test_wait test_wait.c)
+target_include_directories(test_wait PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_link_libraries(test_wait
+    pico_stdlib
+    hardware_gpio
+)
+pico_enable_stdio_usb(test_wait 1)
+pico_enable_stdio_uart(test_wait 0)
+pico_add_extra_outputs(test_wait)
