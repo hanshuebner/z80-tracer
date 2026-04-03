@@ -12,7 +12,7 @@ set(CMAKE_C_STANDARD 11)
 
 pico_sdk_init()
 
-add_executable(z80_tracer main.c)
+add_executable(z80_tracer main.c psram.c)
 
 pico_generate_pio_header(z80_tracer ${CMAKE_CURRENT_LIST_DIR}/z80_trace.pio)
 
@@ -21,10 +21,12 @@ target_include_directories(z80_tracer PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(z80_tracer
     pico_stdlib
     pico_multicore
-    pico_util
     hardware_pio
     hardware_dma
     hardware_gpio
+    hardware_clocks
+    hardware_sync
+    hardware_xip_cache
 )
 
 # Enable stdio USB so pico-sdk configures TinyUSB CDC for us

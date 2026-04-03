@@ -71,26 +71,9 @@ typedef enum {
     CYCLE_IO_WRITE   = 4,   // I/O write
     CYCLE_INT_ACK    = 5,   // Interrupt acknowledge
     CYCLE_RESET      = 6,   // Reset (emitted when /RESET releases)
-    CYCLE_STATUS     = 7,   // Diagnostic status (flow control / overflow)
 } cycle_type_t;
 
-// Status event subtypes (carried in byte 0 bits 2:0 for CYCLE_STATUS packets)
-#define STATUS_WAIT_ASSERT  0x01  // /WAIT asserted (count = total pauses)
-#define STATUS_WAIT_RELEASE 0x02  // /WAIT released
-#define STATUS_DMA_OVERFLOW 0x03  // DMA ring buffer overrun (count = samples lost)
-#define STATUS_TRACE_START  0x04  // Trace started (ack for start command)
-#define STATUS_TRACE_STOP   0x05  // Trace stopped (ack for stop command)
-#define STATUS_FLOW_DISCARD 0x06  // Samples discarded during flow control
-#define STATUS_FRAMES_SENT  0x07  // Total trace frames sent (28-bit: seq=high14, count=low14)
-
-// Binary command protocol (client → firmware):
-// Byte 0: 0xFF  (sync — no trace packet has type >= 16)
-// Byte 1: command code
-#define CMD_SYNC          0xFF
-#define CMD_TRACE_START   0x01
-#define CMD_TRACE_STOP    0x02
-
-// Trace record produced by analyzer state machine (core 1 → core 0)
+// Trace record produced by analyzer state machine (core 1 → PSRAM ring buffer)
 typedef struct {
     uint16_t address;       // A[15:0] captured at T1 rising edge
     uint8_t  data;          // D[7:0] captured at cycle-specific edge
@@ -121,36 +104,47 @@ static inline uint8_t sample_data(uint32_t sample) {
 #define CAPTURE_BUF_SIZE_BYTES  (1u << CAPTURE_BUF_RING_BITS)
 #define CAPTURE_BUF_SIZE_WORDS  (CAPTURE_BUF_SIZE_BYTES / sizeof(uint32_t))
 
-// USB CDC output packet format (binary, bit-7 sync framing):
-// Only byte 0 has bit 7 set — scan for it to resync mid-stream.
-//
-// Normal packets (5 or 6 bytes, cycle_type 0-6):
-//   Byte 0:  1TTTT_AAA   bit7=1 (sync), bits 6-3 = cycle_type, bits 2-0 = addr[15:13]
-//   Byte 1:  0AAA_AAAA   bits 6-0 = addr[12:6]
-//   Byte 2:  0AAA_AAAD   bits 6-1 = addr[5:0], bit 0 = data[7]
-//   Byte 3:  0DDD_DDDD   bits 6-0 = data[6:0]
-//   Byte 4:  0HWW_WWWW   bit 6 = halt, bits 5-0 = wait_count[5:0]
-//   Byte 5 (M1 only): 0RRR_RRRR  bits 6-0 = refresh[6:0]
-//
-// Status packets (5 bytes, cycle_type 7 = CYCLE_STATUS):
-//   Byte 0:  1_0111_SSS  bit7=1, type=7, bits 2-0 = subtype[2:0]
-//   Byte 1:  0SSS_SSSS   bits 6-0 = seq[13:7]  (record sequence counter)
-//   Byte 2:  0SSS_SSSS   bits 6-0 = seq[6:0]
-//   Byte 3:  0CCC_CCCC   bits 6-0 = count[13:7] (event-specific counter)
-//   Byte 4:  0CCC_CCCC   bits 6-0 = count[6:0]
-//
-// Subtypes (in byte 0 bits 2-0):
-//   1 = WAIT asserted (backpressure), count = queue level
-//   2 = WAIT released, count = queue level
-//   3 = DMA ring buffer overrun, count = samples lost
-//
-// The 14-bit sequence counter increments for every record emitted and wraps.
-// Client detects gaps by checking for non-consecutive sequence numbers.
-#define USB_PACKET_SIZE 5
+// --- PSRAM trace ring buffer ---
+// 8 MB PSRAM / 8 bytes per record = 1M records, power of 2
+#define PSRAM_RING_RECORDS      (1u << 20)    // 1,048,576 records
+#define PSRAM_RING_MASK         (PSRAM_RING_RECORDS - 1)
 
-// Flow control thresholds (trace record queue entries)
-#define TRACE_QUEUE_SIZE            256
-#define FLOW_CTRL_ASSERT_THRESHOLD  (TRACE_QUEUE_SIZE * 3 / 4)
-#define FLOW_CTRL_RELEASE_THRESHOLD (TRACE_QUEUE_SIZE / 4)
+// --- Binary command protocol (host → firmware) ---
+// Byte 0: 0xFF (sync — distinguishes commands from stale data)
+// Byte 1: command code
+// Byte 2+: command-specific payload (if any)
+
+#define CMD_SYNC            0xFF
+
+#define CMD_START_CAPTURE   0x01  // Start PIO/DMA + core 1 analysis
+#define CMD_STOP_CAPTURE    0x02  // Stop PIO/DMA
+#define CMD_READ_BUFFER     0x03  // + 4B pre_count (LE) + 4B post_count (LE)
+                                  //   Suspends capture, sends records, resumes
+#define CMD_GET_STATUS      0x04  // Query capture state + counters
+#define CMD_SET_DIAG_MODE   0x05  // + 1 byte: bitmask of disabled components
+
+// --- Capture buffer readout header (firmware → host) ---
+// Sent at the start of a CMD_READ_BUFFER response.
+#define READOUT_MAGIC       0x5A383054u  // "Z80T"
+
+typedef struct {
+    uint32_t magic;           // READOUT_MAGIC
+    uint32_t total_records;   // number of trace_record_t following this header
+    uint32_t write_idx;       // psram_write_idx at time of readout
+    uint32_t flags;           // reserved, 0
+} readout_header_t;
+
+// --- Status response (firmware → host for CMD_GET_STATUS) ---
+#define STATUS_MAGIC        0x53544154u  // "STAT"
+
+typedef struct {
+    uint32_t magic;           // STATUS_MAGIC
+    uint32_t capture_active;  // 1 if PIO/DMA running, 0 if stopped
+    uint32_t write_idx;       // current psram_write_idx
+    uint32_t dma_overflows;   // DMA ring buffer overrun count
+    uint32_t max_dma_distance; // worst DMA backlog (samples)
+    uint32_t max_stage_depth;  // worst staging buffer depth (records)
+    uint32_t total_samples;    // total PIO samples processed
+} status_response_t;
 
 #endif // Z80_TRACE_H

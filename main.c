@@ -3,7 +3,6 @@
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 #include "pico/multicore.h"
-#include "pico/util/queue.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
@@ -12,15 +11,22 @@
 
 #include "z80_trace.h"
 #include "z80_trace.pio.h"
+#include "psram.h"
 
 // ---- DMA ring buffer: PIO samples land here ----
 
 static uint32_t __attribute__((aligned(CAPTURE_BUF_SIZE_BYTES)))
     sample_buf[CAPTURE_BUF_SIZE_WORDS];
 
-// ---- Trace record queue (core 1 → core 0) ----
+// ---- PSRAM trace ring buffer ----
+// Core 1 writes records here.  Core 0 reads for trigger eval / readout.
+// Using uncached address so writes go straight to PSRAM (no cache coherency issues).
 
-static queue_t trace_queue;
+static volatile trace_record_t *psram_ring =
+    (volatile trace_record_t *)PSRAM_BASE_UNCACHED;
+
+// Written by core 1 only, read by core 0.
+static volatile uint32_t psram_write_idx;
 
 // ---- PIO / DMA handles ----
 
@@ -57,11 +63,10 @@ static void gpio_setup(void) {
         gpio_set_dir(ctrl_pins[i], GPIO_IN);
         gpio_disable_pulls(ctrl_pins[i]);
     }
-    // /WAIT: initially input (released), output value preset to 0 for open-drain
+    // /WAIT: input only (no flow control in PSRAM architecture)
     gpio_init(PIN_WAIT);
     gpio_set_dir(PIN_WAIT, GPIO_IN);
     gpio_disable_pulls(PIN_WAIT);
-    gpio_put(PIN_WAIT, 0);
 }
 
 // ---- PIO setup ----
@@ -106,8 +111,8 @@ static inline uint32_t dma_write_index(void) {
 //
 // Key optimizations:
 //  - Lazy signal extraction: each state only reads the signals it needs
-//  - Flow control (queue_get_level with spinlock) only runs when emitting
-//    records (~1.3M/sec), not on every sample (8M/sec)
+//  - PSRAM writes only happen when emitting records (~1.3M/sec), not on
+//    every sample (8M/sec)
 //  - /RESET checked only on rising edges (~4M/sec)
 //  - gpio_hi_in read only in states that need /WAIT, /INT, /NMI
 //
@@ -199,88 +204,71 @@ static struct {
     bool     nmi_pending;
     bool     int_pending;
 
-    // Pending output record (when queue is full)
-    trace_record_t pending;
-    bool     has_pending;
-
     // Synchronization: when true, IDLE only accepts M1 cycles
     bool     syncing;
-
-    // Flow control state: true while /WAIT is asserted
-    bool     wait_asserted;
 
     // Sequence counter for gap detection (7-bit, wraps)
     uint8_t  seq;
 } az;
-
-// ---- Flow control ----
-
-static inline void wait_assert(void) {
-    gpio_set_dir(PIN_WAIT, GPIO_OUT);  // drive low
-    az.wait_asserted = true;
-}
-
-static inline void wait_release(void) {
-    gpio_set_dir(PIN_WAIT, GPIO_IN);   // release (open-drain)
-    az.wait_asserted = false;
-}
 
 #define HI_WAIT_BIT   (1u << (PIN_WAIT  - 32))
 #define HI_INT_BIT    (1u << (PIN_INT   - 32))
 #define HI_NMI_BIT    (1u << (PIN_NMI   - 32))
 #define HI_RESET_BIT  (1u << (PIN_RESET - 32))
 
-// ---- Enqueue a trace record with flow control ----
+// ---- SRAM staging buffer (core 1 → PSRAM) ----
+// emit_record() writes here (fast SRAM write, ~3 cycles).
+// stage_drain_one() is called from the sample processing loop to
+// interleave PSRAM writes with sample processing.
+#define STAGE_BUF_SIZE  256  // power of 2
+#define STAGE_BUF_MASK  (STAGE_BUF_SIZE - 1)
 
-static void enqueue_record(trace_record_t *rec) {
-    if (!queue_try_add(&trace_queue, rec)) {
-        az.pending = *rec;
-        az.has_pending = true;
-        wait_assert();
-    } else {
-        uint32_t level = queue_get_level(&trace_queue);
-        if (level >= FLOW_CTRL_ASSERT_THRESHOLD)
-            wait_assert();
-    }
-}
+static trace_record_t stage_buf[STAGE_BUF_SIZE];
+static uint32_t stage_wr;  // written by emit_record (core 1 only)
+static uint32_t stage_rd;  // read by stage_drain_one (core 1 only)
 
-// ---- Emit a completed trace record ----
+// ---- Emit a completed trace record into SRAM staging buffer ----
 
-static void emit_record(uint8_t cycle_type) {
-    trace_record_t rec;
-    rec.address    = az.address;
-    rec.data       = az.data;
-    rec.cycle_type = cycle_type;
-    rec.refresh    = az.refresh;
-    rec.wait_count = az.wait_count;
-    rec.flags      = 0;
-    rec.seq        = az.seq++ & 0x7F;
-    if (az.halt)        rec.flags |= TRACE_FLAG_HALT;
-    if (az.int_pending) rec.flags |= TRACE_FLAG_INT;
-    if (az.nmi_pending) rec.flags |= TRACE_FLAG_NMI;
+static void __always_inline emit_record(uint8_t cycle_type) {
+    trace_record_t *dst = &stage_buf[stage_wr & STAGE_BUF_MASK];
+    dst->address    = az.address;
+    dst->data       = az.data;
+    dst->cycle_type = cycle_type;
+    dst->refresh    = az.refresh;
+    dst->wait_count = az.wait_count;
+    dst->flags      = 0;
+    dst->seq        = az.seq++ & 0x7F;
+    if (az.halt)        dst->flags |= TRACE_FLAG_HALT;
+    if (az.int_pending) dst->flags |= TRACE_FLAG_INT;
+    if (az.nmi_pending) dst->flags |= TRACE_FLAG_NMI;
 
-    enqueue_record(&rec);
+    stage_wr++;
     az.nmi_pending = false;
 }
 
-// ---- Emit a diagnostic status record ----
-// subtype in byte 0 bits 2:0 (via addr[15:13]), seq in bytes 1-2, count in bytes 3-4.
+// Drain one staged record to PSRAM (amortized: ~42 cycles every few samples)
+static void __not_in_flash_func(stage_drain_one)(void) {
+    if (stage_rd != stage_wr) {
+        psram_ring[psram_write_idx & PSRAM_RING_MASK] =
+            stage_buf[stage_rd & STAGE_BUF_MASK];
+        psram_write_idx++;
+        stage_rd++;
+    }
+}
 
-static void emit_status(uint8_t subtype, uint16_t count) {
-    trace_record_t rec;
-    rec.cycle_type = CYCLE_STATUS;
-    rec.data       = subtype;
-    rec.address    = az.seq;  // current 14-bit seq snapshot
-    rec.wait_count = count & 0x7F;         // count low 7 bits
-    rec.refresh    = (count >> 7) & 0x7F;  // count high 7 bits
-    rec.flags      = 0;
-    rec.seq        = 0;
-    enqueue_record(&rec);
+// Drain all remaining staged records (called between batches)
+static void __not_in_flash_func(stage_drain_all)(void) {
+    while (stage_rd != stage_wr) {
+        psram_ring[psram_write_idx & PSRAM_RING_MASK] =
+            stage_buf[stage_rd & STAGE_BUF_MASK];
+        psram_write_idx++;
+        stage_rd++;
+    }
 }
 
 // ---- Begin a new cycle at T1↑ ----
 
-static inline void begin_cycle(uint32_t sample) {
+static void __always_inline begin_cycle(uint32_t sample) {
     az.address    = sample_addr(sample);
     az.data       = 0;
     az.refresh    = 0;
@@ -291,7 +279,7 @@ static inline void begin_cycle(uint32_t sample) {
 // ---- Process one PIO sample ----
 // Each state extracts only the signals it needs (lazy extraction).
 
-static void process_sample(uint32_t sample) {
+static void __always_inline process_sample(uint32_t sample) {
 
     // /RESET check on rising edges only (~4 cycles overhead, 4M/sec)
     if ((sample & SAMPLE_CLK_BIT) &&
@@ -323,11 +311,6 @@ static void process_sample(uint32_t sample) {
     case ST_RESET:
         // Wait for /RESET to release (checked on both edges for responsiveness)
         if (!(sio_hw->gpio_hi_in & HI_RESET_BIT)) return;  // still in reset
-        // Exiting reset — flush any pending record first
-        if (az.has_pending) {
-            if (!queue_try_add(&trace_queue, &az.pending)) return;
-            az.has_pending = false;
-        }
         az.address = 0; az.data = 0; az.refresh = 0;
         az.wait_count = 0; az.halt = false;
         az.nmi_prev = !(sio_hw->gpio_hi_in & HI_NMI_BIT);
@@ -685,20 +668,31 @@ static void process_sample(uint32_t sample) {
     } // switch
 }
 
+// ---- Diagnostic mode (bitmask, set by CMD_SET_DIAG_MODE) ----
+// Each bit disables a component to isolate performance bottlenecks.
+#define DIAG_SKIP_ANALYZER   (1u << 0)  // don't call process_sample, just count
+#define DIAG_SKIP_PSRAM      (1u << 1)  // don't drain to PSRAM, discard records
+#define DIAG_SKIP_BOTH       (DIAG_SKIP_ANALYZER | DIAG_SKIP_PSRAM)
+
+static volatile uint8_t diag_mode = 0;
+
 // ---- Core 1 entry point ----
 
-// Diagnostic counters (read by core 0 when tracing stops)
-static volatile uint32_t diag_wait_pauses;
+// Diagnostic counters (read by core 0)
 static volatile uint32_t diag_dma_overflows;
-static volatile uint32_t diag_samples_lost;
-static volatile uint32_t diag_flow_discards;  // samples skipped during flow control
+static volatile uint32_t diag_max_dma_distance;   // worst DMA backlog seen
+static volatile uint32_t diag_max_stage_depth;     // worst staging buffer depth
+static volatile uint32_t diag_total_samples;       // total PIO samples processed
 
-static void core1_main(void) {
+static void __not_in_flash_func(core1_main)(void) {
     uint32_t tail = 0;
+    uint32_t sample_count = 0;
 
     memset(&az, 0, sizeof(az));
     az.state = ST_IDLE;
     az.syncing = true;
+    stage_wr = 0;
+    stage_rd = 0;
 
     while (true) {
         if (needs_reset) {
@@ -706,11 +700,13 @@ static void core1_main(void) {
             memset(&az, 0, sizeof(az));
             az.state = ST_IDLE;
             az.syncing = true;
-            wait_release();
-            diag_wait_pauses = 0;
+            stage_wr = 0;
+            stage_rd = 0;
+            sample_count = 0;
             diag_dma_overflows = 0;
-            diag_samples_lost = 0;
-            diag_flow_discards = 0;
+            diag_max_dma_distance = 0;
+            diag_max_stage_depth = 0;
+            diag_total_samples = 0;
             needs_reset = false;
         }
 
@@ -719,97 +715,53 @@ static void core1_main(void) {
         // DMA ring buffer overflow detection: if head has lapped tail,
         // samples were overwritten before core 1 could process them.
         uint32_t distance = (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
+        if (distance > diag_max_dma_distance)
+            diag_max_dma_distance = distance;
         if (__builtin_expect(distance > (CAPTURE_BUF_SIZE_WORDS * 3 / 4), 0)
             && distance != 0) {
             // Jump tail forward to head, losing the overwritten samples
             diag_dma_overflows++;
-            diag_samples_lost += distance;
             tail = head;
             az.state = ST_IDLE;
             az.syncing = true;
         }
 
-        while (tail != head) {
-            // Flush pending record (only involves spinlock when pending)
-            if (__builtin_expect(az.has_pending, 0)) {
-                if (queue_try_add(&trace_queue, &az.pending)) {
-                    az.has_pending = false;
-                    uint32_t level = queue_get_level(&trace_queue);
-                    if (level <= FLOW_CTRL_RELEASE_THRESHOLD) {
-                        wait_release();
-                        diag_wait_pauses++;
-                    }
-                } else {
-                    // Queue still full, /WAIT is asserted but CLK keeps
-                    // running — skip buffered samples.
-                    uint32_t skipped = (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
-                    diag_flow_discards += skipped;
-                    tail = head;
-                    break;
-                }
+        // Process PIO samples with interleaved PSRAM drain.
+        uint8_t mode = diag_mode;
+        if (mode & DIAG_SKIP_ANALYZER) {
+            // Mode 1/3: skip state machine entirely, just count samples
+            uint32_t n = (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
+            sample_count += n;
+            tail = head;
+        } else if (mode & DIAG_SKIP_PSRAM) {
+            // Mode 2: run state machine but discard records (no PSRAM writes)
+            while (tail != head) {
+                process_sample(sample_buf[tail]);
+                tail = (tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+                sample_count++;
             }
-            // /WAIT asserted but no pending record: wait was asserted via
-            // threshold check.  Check if queue has drained enough to release.
-            if (__builtin_expect(az.wait_asserted, 0)) {
-                uint32_t level = queue_get_level(&trace_queue);
-                if (level <= FLOW_CTRL_RELEASE_THRESHOLD) {
-                    wait_release();
-                    diag_wait_pauses++;
-                } else {
-                    // Still above threshold — skip samples
-                    uint32_t skipped = (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
-                    diag_flow_discards += skipped;
-                    tail = head;
-                    break;
-                }
+            // Discard staged records
+            stage_rd = stage_wr;
+        } else {
+            // Normal mode: state machine + interleaved PSRAM drain
+            while (tail != head) {
+                process_sample(sample_buf[tail]);
+                tail = (tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
+                sample_count++;
+                if ((sample_count & 3) == 0)
+                    stage_drain_one();
             }
-            process_sample(sample_buf[tail]);
-            tail = (tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
         }
+
+        // Drain any remaining staged records
+        uint32_t stage_depth = stage_wr - stage_rd;
+        if (stage_depth > diag_max_stage_depth)
+            diag_max_stage_depth = stage_depth;
+        if (!(mode & DIAG_SKIP_PSRAM))
+            stage_drain_all();
+
+        diag_total_samples = sample_count;
     }
-}
-
-// ---- USB output ----
-
-static uint32_t usb_frames_sent;  // total non-status frames emitted over USB
-
-static bool emit_usb_packet(const trace_record_t *rec) {
-    if (tud_cdc_write_available() < USB_PACKET_SIZE) return false;
-
-    uint8_t pkt[USB_PACKET_SIZE + 1];  // +1 for optional refresh byte
-
-    if (rec->cycle_type == CYCLE_STATUS) {
-        // Status packet: subtype in byte 0 addr bits, seq in 1-2, count in 3-4
-        uint8_t subtype = rec->data;
-        uint16_t seq   = rec->address & 0x3FFF;
-        uint16_t count = (rec->refresh << 7) | rec->wait_count;
-        pkt[0] = 0x80 | (CYCLE_STATUS << 3) | (subtype & 0x07);
-        pkt[1] = (seq >> 7) & 0x7F;
-        pkt[2] = seq & 0x7F;
-        pkt[3] = (count >> 7) & 0x7F;
-        pkt[4] = count & 0x7F;
-        tud_cdc_write(pkt, 5);
-        return true;
-    }
-
-    uint16_t addr = rec->address;
-    uint8_t  data = rec->data;
-
-    pkt[0] = 0x80 | ((rec->cycle_type & 0x0F) << 3) | ((addr >> 13) & 0x07);
-    pkt[1] = (addr >> 6) & 0x7F;
-    pkt[2] = ((addr & 0x3F) << 1) | ((data >> 7) & 0x01);
-    pkt[3] = data & 0x7F;
-    pkt[4] = ((rec->flags & TRACE_FLAG_HALT) ? 0x40 : 0)
-           | (rec->wait_count & 0x3F);
-
-    int len = USB_PACKET_SIZE;
-    if (rec->cycle_type == CYCLE_M1_FETCH) {
-        pkt[5] = rec->refresh & 0x7F;
-        len = 6;
-    }
-    tud_cdc_write(pkt, len);
-    usb_frames_sent++;
-    return true;
 }
 
 // ---- Capture start / stop ----
@@ -824,10 +776,10 @@ static void capture_start(void) {
     dma_channel_set_write_addr(dma_chan, sample_buf, false);
     dma_channel_set_trans_count(dma_chan, 0xFFFFFFFF, false);
 
-    usb_frames_sent = 0;
+    // Reset PSRAM write index
+    psram_write_idx = 0;
 
     // Signal core 1 to reset its state while DMA is still stopped.
-    // Core 1 sets tail = dma_write_index() = 0 (since DMA was just reset).
     needs_reset = true;
     while (needs_reset) tight_loop_contents();
 
@@ -839,43 +791,135 @@ static void capture_start(void) {
 static void capture_stop(void) {
     pio_sm_set_enabled(pio, sm, false);
     dma_channel_abort(dma_chan);
-    wait_release();
 }
 
-// ---- Emit a status-only USB packet directly (core 0, outside trace path) ----
-// For most subtypes, count is 14-bit.  For STATUS_FRAMES_SENT, the 28-bit
-// value is split: seq field = high 14 bits, count field = low 14 bits.
+// ---- USB helpers ----
 
-static void send_status(uint8_t subtype, uint16_t count) {
-    uint8_t pkt[USB_PACKET_SIZE];
-    pkt[0] = 0x80 | (CYCLE_STATUS << 3) | (subtype & 0x07);
-    pkt[1] = 0;  // seq high
-    pkt[2] = 0;  // seq low
-    pkt[3] = (count >> 7) & 0x7F;
-    pkt[4] = count & 0x7F;
-    // Wait for space in USB write FIFO, flushing as needed
-    while (tud_cdc_write_available() < USB_PACKET_SIZE) {
-        tud_cdc_write_flush();
+// Read exactly n bytes from USB CDC, blocking until available
+static void usb_read_bytes(uint8_t *buf, uint32_t n) {
+    uint32_t got = 0;
+    while (got < n) {
         tud_task();
+        uint32_t avail = tud_cdc_available();
+        if (avail > 0) {
+            uint32_t want = n - got;
+            if (want > avail) want = avail;
+            tud_cdc_read(buf + got, want);
+            got += want;
+        }
     }
-    tud_cdc_write(pkt, USB_PACKET_SIZE);
 }
 
-// Send a 28-bit value: high 14 bits in seq field, low 14 bits in count field
-static void send_status_wide(uint8_t subtype, uint32_t value) {
-    uint8_t pkt[USB_PACKET_SIZE];
-    uint16_t hi = (value >> 14) & 0x3FFF;
-    uint16_t lo = value & 0x3FFF;
-    pkt[0] = 0x80 | (CYCLE_STATUS << 3) | (subtype & 0x07);
-    pkt[1] = (hi >> 7) & 0x7F;
-    pkt[2] = hi & 0x7F;
-    pkt[3] = (lo >> 7) & 0x7F;
-    pkt[4] = lo & 0x7F;
-    while (tud_cdc_write_available() < USB_PACKET_SIZE) {
-        tud_cdc_write_flush();
+// Write raw bytes to USB CDC, handling backpressure
+static void usb_write_bytes(const void *data, uint32_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t sent = 0;
+    while (sent < len) {
         tud_task();
+        uint32_t avail = tud_cdc_write_available();
+        if (avail > 0) {
+            uint32_t chunk = len - sent;
+            if (chunk > avail) chunk = avail;
+            tud_cdc_write(p + sent, chunk);
+            sent += chunk;
+            tud_cdc_write_flush();
+        }
     }
-    tud_cdc_write(pkt, USB_PACKET_SIZE);
+}
+
+// ---- Command handlers ----
+
+static bool capturing = false;
+
+static void cmd_start_capture(void) {
+    if (!capturing) {
+        capture_start();
+        capturing = true;
+    }
+}
+
+static void cmd_stop_capture(void) {
+    if (capturing) {
+        capture_stop();
+        capturing = false;
+    }
+}
+
+static void cmd_get_status(void) {
+    status_response_t resp;
+    resp.magic = STATUS_MAGIC;
+    resp.capture_active = capturing ? 1 : 0;
+    resp.write_idx = psram_write_idx;
+    resp.dma_overflows = diag_dma_overflows;
+    resp.max_dma_distance = diag_max_dma_distance;
+    resp.max_stage_depth = diag_max_stage_depth;
+    resp.total_samples = diag_total_samples;
+    usb_write_bytes(&resp, sizeof(resp));
+}
+
+static void cmd_read_buffer(void) {
+    // Read parameters: pre_count and post_count (unused for now, send all available)
+    uint8_t params[8];
+    usb_read_bytes(params, 8);
+    uint32_t pre_count  = params[0] | (params[1] << 8) |
+                          (params[2] << 16) | (params[3] << 24);
+    uint32_t post_count = params[4] | (params[5] << 8) |
+                          (params[6] << 16) | (params[7] << 24);
+
+    // Suspend capture while reading
+    bool was_capturing = capturing;
+    if (capturing) {
+        capture_stop();
+        capturing = false;
+    }
+
+    uint32_t widx = psram_write_idx;
+
+    // Determine how many records are available
+    uint32_t available = widx;
+    if (available > PSRAM_RING_RECORDS)
+        available = PSRAM_RING_RECORDS;
+
+    // Clamp requested window to available records
+    if (pre_count > available)
+        pre_count = available;
+    // post_count is relative to a trigger; without triggers, treat widx as the
+    // reference point (most recent record), so post_count = 0 for a snapshot.
+    (void)post_count;
+
+    uint32_t total = pre_count;
+    uint32_t start_idx = widx - total;  // wraps naturally with uint32
+
+    // Send header
+    readout_header_t hdr;
+    hdr.magic = READOUT_MAGIC;
+    hdr.total_records = total;
+    hdr.write_idx = widx;
+    hdr.flags = 0;
+    usb_write_bytes(&hdr, sizeof(hdr));
+
+    // Send records from PSRAM
+    // Read from uncached address to get actual PSRAM contents
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t idx = (start_idx + i) & PSRAM_RING_MASK;
+        trace_record_t rec;
+        // Copy from volatile PSRAM — one field at a time to avoid issues
+        const volatile trace_record_t *src = &psram_ring[idx];
+        rec.address    = src->address;
+        rec.data       = src->data;
+        rec.cycle_type = src->cycle_type;
+        rec.refresh    = src->refresh;
+        rec.wait_count = src->wait_count;
+        rec.flags      = src->flags;
+        rec.seq        = src->seq;
+        usb_write_bytes(&rec, sizeof(rec));
+    }
+
+    // Resume capture if it was running
+    if (was_capturing) {
+        capture_start();
+        capturing = true;
+    }
 }
 
 // ---- Entry point (core 0) ----
@@ -887,7 +931,9 @@ int main(void) {
 
     stdio_init_all();
 
-    queue_init(&trace_queue, sizeof(trace_record_t), TRACE_QUEUE_SIZE);
+    // Init PSRAM before anything else that uses it
+    size_t psram_size = psram_init();
+    (void)psram_size;  // 8 MB expected; detection errors are silent for now
 
     gpio_setup();
     pio_setup();
@@ -896,93 +942,49 @@ int main(void) {
     // Launch analyzer state machine on core 1
     multicore_launch_core1(core1_main);
 
-    bool tracing = false;
     uint8_t cmd_state = 0;  // 0 = idle, 1 = got CMD_SYNC
 
     while (true) {
         tud_task();
 
         if (!tud_cdc_connected()) {
-            if (tracing) {
+            if (capturing) {
                 capture_stop();
-                tracing = false;
+                capturing = false;
             }
             cmd_state = 0;
             continue;
         }
 
-        // Process incoming commands (binary: 0xFF + command byte)
+        // Process incoming commands (binary: 0xFF + command byte + payload)
         while (tud_cdc_available()) {
             uint8_t ch;
             tud_cdc_read(&ch, 1);
             if (cmd_state == 0) {
                 if (ch == CMD_SYNC) cmd_state = 1;
-                // ignore other bytes (e.g. stale data)
             } else {
                 cmd_state = 0;
-                if (ch == CMD_TRACE_START && !tracing) {
-                    capture_start();
-                    tracing = true;
-                    send_status(STATUS_TRACE_START, 0);
-                    tud_cdc_write_flush();
-                } else if (ch == CMD_TRACE_STOP && tracing) {
-                    capture_stop();
-                    tracing = false;
-
-                    // Drain remaining records from queue, handling USB backpressure
-                    trace_record_t rec;
-                    while (queue_try_remove(&trace_queue, &rec)) {
-                        while (!emit_usb_packet(&rec)) {
-                            tud_task();
-                            tud_cdc_write_flush();
-                        }
-                    }
-                    tud_cdc_write_flush();
-                    tud_task();
-
-                    // Emit diagnostic summary — only if events occurred
-                    if (diag_wait_pauses > 0) {
-                        uint16_t wp = diag_wait_pauses > 0x3FFF ? 0x3FFF : diag_wait_pauses;
-                        send_status(STATUS_WAIT_ASSERT, wp);
-                    }
-                    if (diag_dma_overflows > 0) {
-                        uint16_t ov = diag_dma_overflows > 0x3FFF ? 0x3FFF : diag_dma_overflows;
-                        send_status(STATUS_DMA_OVERFLOW, ov);
-                    }
-                    if (diag_flow_discards > 0) {
-                        send_status_wide(STATUS_FLOW_DISCARD, diag_flow_discards);
-                    }
-                    // Always send total frames so client can detect USB loss
-                    send_status_wide(STATUS_FRAMES_SENT, usb_frames_sent);
-                    // Final stop acknowledgement
-                    send_status(STATUS_TRACE_STOP, 0);
-                    tud_cdc_write_flush();
-                    tud_task();
+                switch (ch) {
+                case CMD_START_CAPTURE:
+                    cmd_start_capture();
+                    break;
+                case CMD_STOP_CAPTURE:
+                    cmd_stop_capture();
+                    break;
+                case CMD_READ_BUFFER:
+                    cmd_read_buffer();
+                    break;
+                case CMD_GET_STATUS:
+                    cmd_get_status();
+                    break;
+                case CMD_SET_DIAG_MODE: {
+                    uint8_t mode;
+                    usb_read_bytes(&mode, 1);
+                    diag_mode = mode;
+                    break;
+                }
                 }
             }
-        }
-
-        if (tracing) {
-            // Drain trace queue to USB
-            static trace_record_t usb_pending;
-            static bool usb_has_pending = false;
-
-            if (usb_has_pending) {
-                if (emit_usb_packet(&usb_pending))
-                    usb_has_pending = false;
-            }
-
-            if (!usb_has_pending) {
-                trace_record_t rec;
-                while (queue_try_remove(&trace_queue, &rec)) {
-                    if (!emit_usb_packet(&rec)) {
-                        usb_pending = rec;
-                        usb_has_pending = true;
-                        break;
-                    }
-                }
-            }
-            tud_cdc_write_flush();
         }
     }
 }
