@@ -63,10 +63,11 @@ static void gpio_setup(void) {
         gpio_set_dir(ctrl_pins[i], GPIO_IN);
         gpio_disable_pulls(ctrl_pins[i]);
     }
-    // /WAIT: input only (no flow control in PSRAM architecture)
+    // /WAIT: initially input (released), output value preset to 0 for open-drain
     gpio_init(PIN_WAIT);
     gpio_set_dir(PIN_WAIT, GPIO_IN);
     gpio_disable_pulls(PIN_WAIT);
+    gpio_put(PIN_WAIT, 0);
 }
 
 // ---- PIO setup ----
@@ -674,6 +675,30 @@ static void __always_inline process_sample(uint32_t sample) {
     } // switch
 }
 
+// ---- /WAIT flow control (open-drain on GPIO 32) ----
+// Output latch preset to 0.  Assert = set dir to GPIO_OUT (drives low).
+// Release = set dir to GPIO_IN (high-Z, external pull-up restores high).
+// Shared with screen controller — never drive high.
+
+#define DMA_WAIT_ASSERT_THRESHOLD   (CAPTURE_BUF_SIZE_WORDS / 2)      // 50%
+#define DMA_WAIT_RELEASE_THRESHOLD  (CAPTURE_BUF_SIZE_WORDS / 4)      // 25%
+
+static bool wait_asserted = false;
+
+static inline void wait_assert(void) {
+    if (!wait_asserted) {
+        gpio_set_dir(PIN_WAIT, GPIO_OUT);  // drive low
+        wait_asserted = true;
+    }
+}
+
+static inline void wait_release(void) {
+    if (wait_asserted) {
+        gpio_set_dir(PIN_WAIT, GPIO_IN);   // high-Z
+        wait_asserted = false;
+    }
+}
+
 // ---- Diagnostic mode (bitmask, set by CMD_SET_DIAG_MODE) ----
 // Each bit disables a component to isolate performance bottlenecks.
 #define DIAG_SKIP_ANALYZER   (1u << 0)  // don't call process_sample, just count
@@ -689,6 +714,7 @@ static volatile uint32_t diag_dma_overflows;
 static volatile uint32_t diag_max_dma_distance;   // worst DMA backlog seen
 static volatile uint32_t diag_max_stage_depth;     // worst staging buffer depth
 static volatile uint32_t diag_total_samples;       // total PIO samples processed
+static volatile uint32_t diag_wait_asserts;        // /WAIT assertion count
 
 static void __not_in_flash_func(core1_main)(void) {
     uint32_t tail = 0;
@@ -713,19 +739,28 @@ static void __not_in_flash_func(core1_main)(void) {
             diag_max_dma_distance = 0;
             diag_max_stage_depth = 0;
             diag_total_samples = 0;
+            diag_wait_asserts = 0;
+            wait_release();
             needs_reset = false;
         }
 
         uint32_t head = dma_write_index();
 
-        // DMA ring buffer overflow detection: if head has lapped tail,
-        // samples were overwritten before core 1 could process them.
+        // DMA buffer fullness check + /WAIT flow control
         uint32_t distance = (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
         if (distance > diag_max_dma_distance)
             diag_max_dma_distance = distance;
+
+        if (__builtin_expect(distance > DMA_WAIT_ASSERT_THRESHOLD, 0)
+            && distance != 0) {
+            // Assert /WAIT to pause Z80 before we overflow
+            if (!wait_asserted) diag_wait_asserts++;
+            wait_assert();
+        }
+
+        // DMA overflow detection (shouldn't happen with /WAIT, but safety net)
         if (__builtin_expect(distance > (CAPTURE_BUF_SIZE_WORDS * 3 / 4), 0)
             && distance != 0) {
-            // Jump tail forward to head, losing the overwritten samples
             diag_dma_overflows++;
             tail = head;
             az.state = ST_IDLE;
@@ -766,6 +801,13 @@ static void __not_in_flash_func(core1_main)(void) {
         if (!(mode & DIAG_SKIP_PSRAM))
             stage_drain_all();
 
+        // Release /WAIT once we've caught up
+        if (wait_asserted) {
+            uint32_t new_dist = (dma_write_index() - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
+            if (new_dist <= DMA_WAIT_RELEASE_THRESHOLD)
+                wait_release();
+        }
+
         diag_total_samples = sample_count;
     }
 }
@@ -797,6 +839,7 @@ static void capture_start(void) {
 static void capture_stop(void) {
     pio_sm_set_enabled(pio, sm, false);
     dma_channel_abort(dma_chan);
+    wait_release();
 }
 
 // ---- USB helpers ----
@@ -833,39 +876,172 @@ static void usb_write_bytes(const void *data, uint32_t len) {
     }
 }
 
+// ---- Trigger + capture state machine (core 0) ----
+
+static capture_state_t cap_state = CAP_IDLE;
+static trigger_t triggers[MAX_TRIGGERS];
+static uint32_t trigger_count = 0;
+static uint32_t trigger_idx;          // write_idx when trigger fired
+static uint32_t post_trigger_count;   // how many records to capture after trigger
+static uint32_t post_trigger_remain;  // countdown after trigger
+static uint32_t trigger_chase_idx;    // core 0's read position chasing core 1
+
+// Check one record against all configured triggers
+static bool check_triggers(const trace_record_t *rec) {
+    for (uint32_t i = 0; i < trigger_count; i++) {
+        const trigger_t *t = &triggers[i];
+        bool match = false;
+
+        switch (t->type) {
+        case TRIG_PC_MATCH:
+            if (rec->cycle_type == CYCLE_M1_FETCH &&
+                rec->address >= t->addr_lo && rec->address <= t->addr_hi)
+                match = true;
+            break;
+        case TRIG_MEM_READ:
+            if (rec->cycle_type == CYCLE_MEM_READ &&
+                rec->address >= t->addr_lo && rec->address <= t->addr_hi)
+                match = true;
+            break;
+        case TRIG_MEM_WRITE:
+            if (rec->cycle_type == CYCLE_MEM_WRITE &&
+                rec->address >= t->addr_lo && rec->address <= t->addr_hi)
+                match = true;
+            break;
+        case TRIG_IO_READ:
+            if (rec->cycle_type == CYCLE_IO_READ &&
+                rec->address >= t->addr_lo && rec->address <= t->addr_hi)
+                match = true;
+            break;
+        case TRIG_IO_WRITE:
+            if (rec->cycle_type == CYCLE_IO_WRITE &&
+                rec->address >= t->addr_lo && rec->address <= t->addr_hi)
+                match = true;
+            break;
+        case TRIG_INT_ACK:
+            if (rec->cycle_type == CYCLE_INT_ACK)
+                match = true;
+            break;
+        }
+
+        if (match && t->data_mask) {
+            if ((rec->data & t->data_mask) != (t->data_val & t->data_mask))
+                match = false;
+        }
+
+        if (match) return true;
+    }
+    return false;
+}
+
+// Run trigger evaluation: chase core 1's write_idx, check each record
+static void trigger_eval(void) {
+    uint32_t widx = psram_write_idx;
+
+    while (trigger_chase_idx != widx) {
+        uint32_t idx = trigger_chase_idx & PSRAM_RING_MASK;
+        // Read from uncached PSRAM
+        const volatile trace_record_t *src = &psram_ring[idx];
+        trace_record_t rec;
+        rec.address    = src->address;
+        rec.data       = src->data;
+        rec.cycle_type = src->cycle_type;
+        rec.refresh    = src->refresh;
+        rec.wait_count = src->wait_count;
+        rec.flags      = src->flags;
+        rec.seq        = src->seq;
+
+        if (cap_state == CAP_ARMED) {
+            if (check_triggers(&rec)) {
+                trigger_idx = trigger_chase_idx;
+                post_trigger_remain = post_trigger_count;
+                cap_state = CAP_TRIGGERED;
+            }
+        }
+
+        if (cap_state == CAP_TRIGGERED) {
+            if (post_trigger_remain == 0) {
+                capture_stop();
+                cap_state = CAP_DONE;
+                return;
+            }
+            post_trigger_remain--;
+        }
+
+        trigger_chase_idx++;
+    }
+}
+
 // ---- Command handlers ----
 
-static bool capturing = false;
-
 static void cmd_start_capture(void) {
-    if (!capturing) {
+    if (cap_state == CAP_IDLE || cap_state == CAP_DONE) {
         capture_start();
-        capturing = true;
+        trigger_chase_idx = psram_write_idx;
+        cap_state = CAP_RUNNING;
     }
 }
 
 static void cmd_stop_capture(void) {
-    if (capturing) {
+    if (cap_state != CAP_IDLE) {
         capture_stop();
-        capturing = false;
+        cap_state = CAP_IDLE;
     }
+}
+
+static void cmd_arm_trigger(void) {
+    uint8_t params[4];
+    usb_read_bytes(params, 4);
+    post_trigger_count = params[0] | (params[1] << 8) |
+                         (params[2] << 16) | (params[3] << 24);
+
+    if (cap_state == CAP_RUNNING) {
+        trigger_chase_idx = psram_write_idx;
+        cap_state = CAP_ARMED;
+    } else if (cap_state == CAP_IDLE || cap_state == CAP_DONE) {
+        // Start capture and arm in one step
+        capture_start();
+        trigger_chase_idx = psram_write_idx;
+        cap_state = CAP_ARMED;
+    }
+}
+
+static void cmd_set_trigger(void) {
+    uint8_t buf[7];
+    usb_read_bytes(buf, 7);
+    if (trigger_count < MAX_TRIGGERS) {
+        trigger_t *t = &triggers[trigger_count];
+        t->type    = buf[0];
+        t->addr_lo = buf[1] | (buf[2] << 8);
+        t->addr_hi = buf[3] | (buf[4] << 8);
+        t->data_val  = buf[5];
+        t->data_mask = buf[6];
+        trigger_count++;
+    }
+}
+
+static void cmd_clear_triggers(void) {
+    trigger_count = 0;
+    memset(triggers, 0, sizeof(triggers));
 }
 
 static void cmd_get_status(void) {
     status_response_t resp;
     resp.magic = STATUS_MAGIC;
-    resp.capture_active = capturing ? 1 : 0;
+    resp.capture_state = cap_state;
     resp.write_idx = psram_write_idx;
     resp.dma_overflows = diag_dma_overflows;
     resp.max_dma_distance = diag_max_dma_distance;
     resp.max_stage_depth = diag_max_stage_depth;
     resp.total_samples = diag_total_samples;
     resp.cpu_clock_khz = clock_get_hz(clk_sys) / 1000;
+    resp.trigger_idx = trigger_idx;
+    resp.trigger_count = trigger_count;
+    resp.wait_asserts = diag_wait_asserts;
     usb_write_bytes(&resp, sizeof(resp));
 }
 
 static void cmd_read_buffer(void) {
-    // Read parameters: pre_count and post_count (unused for now, send all available)
     uint8_t params[8];
     usb_read_bytes(params, 8);
     uint32_t pre_count  = params[0] | (params[1] << 8) |
@@ -874,43 +1050,52 @@ static void cmd_read_buffer(void) {
                           (params[6] << 16) | (params[7] << 24);
 
     // Suspend capture while reading
-    bool was_capturing = capturing;
-    if (capturing) {
+    capture_state_t prev_state = cap_state;
+    if (cap_state != CAP_IDLE) {
         capture_stop();
-        capturing = false;
+    }
+
+    // Reference point: trigger_idx if we triggered, else current write_idx
+    uint32_t ref_idx;
+    bool has_trigger = (prev_state == CAP_TRIGGERED || prev_state == CAP_DONE);
+    if (has_trigger) {
+        ref_idx = trigger_idx;
+    } else {
+        ref_idx = psram_write_idx;
     }
 
     uint32_t widx = psram_write_idx;
 
-    // Determine how many records are available
+    // Determine available records before and after reference point
     uint32_t available = widx;
     if (available > PSRAM_RING_RECORDS)
         available = PSRAM_RING_RECORDS;
 
-    // Clamp requested window to available records
-    if (pre_count > available)
-        pre_count = available;
-    // post_count is relative to a trigger; without triggers, treat widx as the
-    // reference point (most recent record), so post_count = 0 for a snapshot.
-    (void)post_count;
+    // Records before ref point
+    uint32_t avail_pre = ref_idx - (widx - available);
+    if (avail_pre > available) avail_pre = available;
+    if (pre_count > avail_pre) pre_count = avail_pre;
 
-    uint32_t total = pre_count;
-    uint32_t start_idx = widx - total;  // wraps naturally with uint32
+    // Records after ref point (only meaningful if triggered)
+    uint32_t avail_post = widx - ref_idx;
+    if (avail_post > available) avail_post = 0;
+    if (post_count > avail_post) post_count = avail_post;
+
+    uint32_t total = pre_count + post_count;
+    uint32_t start_idx = ref_idx - pre_count;
 
     // Send header
     readout_header_t hdr;
     hdr.magic = READOUT_MAGIC;
     hdr.total_records = total;
     hdr.write_idx = widx;
-    hdr.flags = 0;
+    hdr.trigger_offset = has_trigger ? pre_count : 0xFFFFFFFF;
     usb_write_bytes(&hdr, sizeof(hdr));
 
     // Send records from PSRAM
-    // Read from uncached address to get actual PSRAM contents
     for (uint32_t i = 0; i < total; i++) {
         uint32_t idx = (start_idx + i) & PSRAM_RING_MASK;
         trace_record_t rec;
-        // Copy from volatile PSRAM — one field at a time to avoid issues
         const volatile trace_record_t *src = &psram_ring[idx];
         rec.address    = src->address;
         rec.data       = src->data;
@@ -922,10 +1107,13 @@ static void cmd_read_buffer(void) {
         usb_write_bytes(&rec, sizeof(rec));
     }
 
-    // Resume capture if it was running
-    if (was_capturing) {
+    // Resume capture if it was running (not if trigger-done)
+    if (prev_state == CAP_RUNNING || prev_state == CAP_ARMED) {
         capture_start();
-        capturing = true;
+        trigger_chase_idx = psram_write_idx;
+        cap_state = prev_state;
+    } else {
+        cap_state = CAP_IDLE;
     }
 }
 
@@ -955,9 +1143,9 @@ int main(void) {
         tud_task();
 
         if (!tud_cdc_connected()) {
-            if (capturing) {
+            if (cap_state != CAP_IDLE) {
                 capture_stop();
-                capturing = false;
+                cap_state = CAP_IDLE;
             }
             cmd_state = 0;
             continue;
@@ -990,8 +1178,21 @@ int main(void) {
                     diag_mode = mode;
                     break;
                 }
+                case CMD_SET_TRIGGER:
+                    cmd_set_trigger();
+                    break;
+                case CMD_CLEAR_TRIGGERS:
+                    cmd_clear_triggers();
+                    break;
+                case CMD_ARM_TRIGGER:
+                    cmd_arm_trigger();
+                    break;
                 }
             }
         }
+
+        // Run trigger evaluation when armed or post-trigger
+        if (cap_state == CAP_ARMED || cap_state == CAP_TRIGGERED)
+            trigger_eval();
     }
 }

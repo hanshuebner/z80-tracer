@@ -1,9 +1,8 @@
 """
 PSRAM capture protocol client for the Z80 tracer.
 
-Communicates with the new firmware that stores trace records in an 8 MB
-PSRAM ring buffer.  No real-time streaming — the client requests a
-snapshot of the buffer and decodes it offline.
+Communicates with the firmware that stores trace records in an 8 MB
+PSRAM ring buffer with on-device trigger support.
 """
 
 import struct
@@ -18,23 +17,43 @@ CMD_STOP_CAPTURE   = 0x02
 CMD_READ_BUFFER    = 0x03
 CMD_GET_STATUS     = 0x04
 CMD_SET_DIAG_MODE  = 0x05
+CMD_SET_TRIGGER    = 0x10
+CMD_CLEAR_TRIGGERS = 0x11
+CMD_ARM_TRIGGER    = 0x12
+
+# Trigger types (must match trigger_type_t)
+TRIG_NONE      = 0
+TRIG_PC_MATCH  = 1
+TRIG_MEM_READ  = 2
+TRIG_MEM_WRITE = 3
+TRIG_IO_READ   = 4
+TRIG_IO_WRITE  = 5
+TRIG_INT_ACK   = 6
+
+# Capture states (must match capture_state_t)
+CAP_IDLE      = 0
+CAP_RUNNING   = 1
+CAP_ARMED     = 2
+CAP_TRIGGERED = 3
+CAP_DONE      = 4
+
+CAP_STATE_NAMES = {
+    CAP_IDLE: 'IDLE',
+    CAP_RUNNING: 'RUNNING',
+    CAP_ARMED: 'ARMED',
+    CAP_TRIGGERED: 'TRIGGERED',
+    CAP_DONE: 'DONE',
+}
 
 # Diagnostic mode bits
-DIAG_SKIP_ANALYZER = 0x01  # skip process_sample, just count
-DIAG_SKIP_PSRAM    = 0x02  # run analyzer but discard records (no PSRAM writes)
-DIAG_SKIP_BOTH     = 0x03  # skip both
+DIAG_SKIP_ANALYZER = 0x01
+DIAG_SKIP_PSRAM    = 0x02
+DIAG_SKIP_BOTH     = 0x03
 
 READOUT_MAGIC      = 0x5A383054  # "Z80T"
 STATUS_MAGIC       = 0x53544154  # "STAT"
 
 # trace_record_t layout: 8 bytes
-#   uint16_t address
-#   uint8_t  data
-#   uint8_t  cycle_type
-#   uint8_t  refresh
-#   uint8_t  wait_count
-#   uint8_t  flags
-#   uint8_t  seq
 RECORD_FMT = '<HBBBBBB'
 RECORD_SIZE = struct.calcsize(RECORD_FMT)  # 8
 
@@ -74,41 +93,60 @@ def read_exact(ser, n, timeout=10.0):
 def get_status(ser):
     """Query firmware status. Returns dict with capture state and diagnostics."""
     send_cmd(ser, CMD_GET_STATUS)
-    raw = read_exact(ser, 32)
-    (magic, capture_active, write_idx, dma_overflows,
+    raw = read_exact(ser, 44)
+    (magic, capture_state, write_idx, dma_overflows,
      max_dma_distance, max_stage_depth, total_samples,
-     cpu_clock_khz) = struct.unpack('<IIIIIIII', raw)
+     cpu_clock_khz, trigger_idx, trigger_count,
+     wait_asserts) = struct.unpack('<IIIIIIIIIII', raw)
     if magic != STATUS_MAGIC:
         raise ValueError(f"Bad status magic: 0x{magic:08X} (expected 0x{STATUS_MAGIC:08X})")
     return {
-        'capture_active': bool(capture_active),
+        'capture_state': capture_state,
+        'capture_state_name': CAP_STATE_NAMES.get(capture_state, f'?{capture_state}'),
+        'capture_active': capture_state != CAP_IDLE,
         'write_idx': write_idx,
         'dma_overflows': dma_overflows,
         'max_dma_distance': max_dma_distance,
         'max_stage_depth': max_stage_depth,
         'total_samples': total_samples,
         'cpu_clock_khz': cpu_clock_khz,
+        'trigger_idx': trigger_idx,
+        'trigger_count': trigger_count,
+        'wait_asserts': wait_asserts,
     }
 
 
 def start_capture(ser):
-    """Start PIO/DMA capture."""
+    """Start PIO/DMA capture (CAP_RUNNING)."""
     send_cmd(ser, CMD_START_CAPTURE)
 
 
 def stop_capture(ser):
-    """Stop PIO/DMA capture."""
+    """Stop PIO/DMA capture (CAP_IDLE)."""
     send_cmd(ser, CMD_STOP_CAPTURE)
 
 
-def set_diag_mode(ser, mode):
-    """Set diagnostic mode bitmask.
+def set_trigger(ser, trig_type, addr_lo, addr_hi=None, data_val=0, data_mask=0):
+    """Add a trigger. addr_hi defaults to addr_lo for exact match."""
+    if addr_hi is None:
+        addr_hi = addr_lo
+    payload = struct.pack('<BHHBB', trig_type, addr_lo, addr_hi, data_val, data_mask)
+    send_cmd(ser, CMD_SET_TRIGGER, payload)
 
-    0 = normal (full pipeline)
-    1 = DIAG_SKIP_ANALYZER: skip state machine, just count samples (max throughput baseline)
-    2 = DIAG_SKIP_PSRAM: run analyzer but discard records (isolate analyzer cost)
-    3 = DIAG_SKIP_BOTH: skip everything (pure DMA read baseline)
-    """
+
+def clear_triggers(ser):
+    """Clear all configured triggers."""
+    send_cmd(ser, CMD_CLEAR_TRIGGERS)
+
+
+def arm_trigger(ser, post_trigger_count):
+    """Arm triggers with given post-trigger record count. Starts capture if idle."""
+    payload = struct.pack('<I', post_trigger_count)
+    send_cmd(ser, CMD_ARM_TRIGGER, payload)
+
+
+def set_diag_mode(ser, mode):
+    """Set diagnostic mode bitmask."""
     send_cmd(ser, CMD_SET_DIAG_MODE, bytes([mode]))
 
 
@@ -116,21 +154,16 @@ def read_buffer(ser, pre_count, post_count=0, progress=True):
     """
     Read trace records from the PSRAM ring buffer.
 
-    Args:
-        ser: serial.Serial instance
-        pre_count: number of records before the reference point
-        post_count: number of records after (0 for snapshot mode)
-        progress: print transfer progress
-
     Returns:
-        list of tuples: (address, data, cycle_type, refresh, wait_count, flags, seq)
+        (records, trigger_offset) where trigger_offset is the index of the
+        trigger record within the list, or None if no trigger.
     """
     payload = struct.pack('<II', pre_count, post_count)
     send_cmd(ser, CMD_READ_BUFFER, payload)
 
     # Read header
     hdr_raw = read_exact(ser, 16, timeout=5.0)
-    magic, total_records, write_idx, flags = struct.unpack('<IIII', hdr_raw)
+    magic, total_records, write_idx, trigger_offset = struct.unpack('<IIII', hdr_raw)
     if magic != READOUT_MAGIC:
         raise ValueError(f"Bad readout magic: 0x{magic:08X} (expected 0x{READOUT_MAGIC:08X})")
 
@@ -148,10 +181,13 @@ def read_buffer(ser, pre_count, post_count=0, progress=True):
         rec = struct.unpack(RECORD_FMT, raw[offset:offset + RECORD_SIZE])
         records.append(rec)
 
-    if progress:
-        print(f"Received {len(records):,} records (write_idx={write_idx})")
+    trig_off = trigger_offset if trigger_offset != 0xFFFFFFFF else None
 
-    return records
+    if progress:
+        trig_str = f", trigger at #{trig_off}" if trig_off is not None else ""
+        print(f"Received {len(records):,} records{trig_str}")
+
+    return records, trig_off
 
 
 def format_record(rec):
