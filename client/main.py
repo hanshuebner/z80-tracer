@@ -21,6 +21,7 @@ from . import z80_decoder as dec
 from .z80_state import Z80State
 from .z80_loop import LoopDetector
 from .trace_filter import TraceFilter, FilterConfig, parse_address_range, parse_address_or_range, parse_trigger_addr
+from .memory_trace import MemoryTracer
 
 
 # -- Wire protocol (matches firmware z80_trace.h) --
@@ -77,6 +78,7 @@ class InstructionAssembler:
         # Interrupt state — set by feed(), read and cleared by caller
         self.int_ack = None    # (addr, vector) when INT acknowledge detected
         self.nmi_detected = False  # True when NMI detected
+        self._int_pending = False  # suppress duplicate INTACKs until next FETCH
 
     def _reset(self):
         self._state = "IDLE"
@@ -118,13 +120,86 @@ class InstructionAssembler:
         return None
 
     def _on_int_ack(self, addr, value):
-        """Handle INT acknowledge cycle.  Finalizes current instruction."""
+        """Handle INT acknowledge cycle.  Finalizes current instruction.
+
+        On a Z80, INTACK only occurs after the current instruction completes.
+        The 2 internal T-states before INTACK may produce misclassified bus
+        cycles (MREAD/MWRITE) from the firmware — strip those for instructions
+        known to have no data-phase memory access.  Duplicate INTACKs
+        (likely misclassified internal T-states) are suppressed until the
+        next opcode fetch.
+        """
+        if self._int_pending:
+            return None  # suppress duplicate INTACK
+        self._int_pending = True
         self.int_ack = (addr, value)
         if self._state != "IDLE":
+            if self._instruction_has_no_data_phase():
+                self._data_reads = []
+                self._data_writes = []
             result = self._finalize()
             self._reset()
             return result
         return None
+
+    def _instruction_has_no_data_phase(self):
+        """True if the instruction definitely has no data-phase memory ops.
+
+        Conservative: returns False (keep data) for unknown instructions.
+        """
+        op = self._opcode
+
+        if self._prefix == "IXCB":
+            return False  # always accesses (IX+d)/(IY+d)
+
+        if self._prefix == "CB":
+            return (op & 0x07) != 6  # register variants only
+
+        if self._prefix == "ED":
+            if 0xA0 <= op <= 0xBB:  # block ops
+                return False
+            if (op & 0xC7) == 0x43:  # LD (nn),rr / LD rr,(nn)
+                return False
+            if op in (0x45, 0x4D, 0x55, 0x5D, 0x65, 0x6D, 0x75, 0x7D):
+                return False  # RETN/RETI (pop PC)
+            return True  # NEG, IM, LD I/R/A, IN/OUT (C)
+
+        if self._prefix == "IX":
+            if (op & 0xCF) in (0xC1, 0xC5):  # POP/PUSH IX/IY
+                return False
+            if op == 0xE3:  # EX (SP),IX/IY
+                return False
+            if op in (0x34, 0x35, 0x36):  # INC/DEC/LD (IX+d)
+                return False
+            if 0x40 <= op <= 0x7F and op != 0x76:
+                if (op & 0x07) == 6 or (op & 0x38) == 0x30:
+                    return False  # accesses (IX+d)
+            if 0x80 <= op <= 0xBF and (op & 0x07) == 6:
+                return False
+            return True
+
+        # Main table (no prefix)
+        if (op & 0xCF) in (0xC1, 0xC5):  # POP/PUSH
+            return False
+        if op == 0xC9 or (op & 0xC7) == 0xC0:  # RET / RET cc
+            return False
+        if op == 0xCD or (op & 0xC7) == 0xC4:  # CALL / CALL cc
+            return False
+        if (op & 0xC7) == 0xC7:  # RST
+            return False
+        if op == 0xE3:  # EX (SP),HL
+            return False
+        if op in (0x02, 0x0A, 0x12, 0x1A, 0x22, 0x2A, 0x32, 0x3A):
+            return False  # LD (BC/DE/nn),A / LD A,(BC/DE/nn) / LD (nn),HL / LD HL,(nn)
+        if op in (0x34, 0x35, 0x36):  # INC/DEC (HL), LD (HL),n
+            return False
+        if 0x40 <= op <= 0x7F and op != 0x76:
+            if (op & 0x07) == 6 or (op & 0x38) == 0x30:
+                return False  # LD r,(HL) or LD (HL),r
+        if 0x80 <= op <= 0xBF and (op & 0x07) == 6:
+            return False  # ALU A,(HL)
+
+        return True
 
     def _on_opcode_fetch(self, addr, value):
         if self._state == "IDLE":
@@ -199,6 +274,7 @@ class InstructionAssembler:
         self._data_writes = []
         self._io_reads = []
         self._io_writes = []
+        self._int_pending = False
 
         self._pc = addr
         self._raw_bytes = [value]
@@ -315,7 +391,9 @@ def format_instruction(instr, reg_changes):
 # -- Main trace loop --
 
 def run_trace(source: BinaryIO, raw_output=False, is_file=False,
-              detect_loops=True, filter_config=None):
+              detect_loops=True, filter_config=None,
+              max_frames=None, max_instructions=None,
+              memory_tracer=None, show_interrupts=True):
     assembler = InstructionAssembler()
     state = Z80State()
     loop_det = LoopDetector()
@@ -323,6 +401,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
     trace_filter = (TraceFilter(filter_config, format_instruction)
                     if filter_config and filter_config.has_any_config else None)
     instr_count = 0
+    frame_count = 0
 
     buf = bytearray()
 
@@ -356,6 +435,16 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
 
                 cycle_type, addr, value, refresh, wait_count, halt = parse_packet(pkt)
 
+                frame_count += 1
+                if max_frames is not None and frame_count > max_frames:
+                    raise KeyboardInterrupt
+
+                if memory_tracer:
+                    if cycle_type in (CYCLE_OPCODE_FETCH, CYCLE_MEM_READ):
+                        memory_tracer.record_read(addr)
+                    elif cycle_type == CYCLE_MEM_WRITE:
+                        memory_tracer.record_write(addr)
+
                 if raw_output:
                     ct_name = CYCLE_NAMES[cycle_type] if cycle_type < len(CYCLE_NAMES) else "?"
                     extras = ""
@@ -372,7 +461,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
 
                 if cycle_type == CYCLE_RESET:
                     raw_buf.clear()
-                    if filter_active:
+                    if show_interrupts and filter_active:
                         print(f"; --- RESET ---")
                     continue
 
@@ -382,11 +471,11 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 if assembler.int_ack:
                     iaddr, ivec = assembler.int_ack
                     assembler.int_ack = None
-                    if filter_active:
+                    if show_interrupts and filter_active:
                         print(f"; --- INT acknowledge at ${iaddr:04X}, vector=${ivec:02X} ---")
                 if assembler.nmi_detected:
                     assembler.nmi_detected = False
-                    if filter_active:
+                    if show_interrupts and filter_active:
                         print(f"; --- NMI ---")
 
                 if instr is None:
@@ -408,6 +497,9 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 prev_snap = state.snapshot_key()
                 state.execute(instr)
                 instr_count += 1
+
+                if max_instructions is not None and instr_count > max_instructions:
+                    raise KeyboardInterrupt
 
                 # Loop detection
                 state_key = state.snapshot_key()
@@ -464,7 +556,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
         if summary:
             print(summary)
 
-    print(f"\n--- {instr_count} instructions traced ---")
+    print(f"\n--- {instr_count} instructions, {frame_count} frames traced ---")
     print(state.format_registers())
 
 
@@ -488,6 +580,9 @@ def main():
     parser.add_argument(
         "--loops", action="store_true",
         help="Enable loop detection (suppress repeated sequences)")
+    parser.add_argument(
+        "--no-interrupts", action="store_true",
+        help="Suppress INT/NMI/RESET event markers in output")
     parser.add_argument(
         "--hexdump", action="store_true",
         help="Dump raw USB bytes in hex and exit (diagnostic)")
@@ -529,6 +624,18 @@ def main():
     parser.add_argument(
         "--window", type=int, default=0, metavar="N",
         help="Show N instructions before trigger event")
+    parser.add_argument(
+        "--max-frames", type=int, default=None, metavar="N",
+        help="Stop after processing N bus cycle frames (regardless of filtering)")
+    parser.add_argument(
+        "--max-instructions", type=int, default=None, metavar="N",
+        help="Stop after processing N instructions (regardless of filtering)")
+    parser.add_argument(
+        "--memory-report", action="store_true",
+        help="Track memory access and print report on exit")
+    parser.add_argument(
+        "--memory-report-format", default="text", metavar="FMT",
+        help="Memory report format (default: text)")
 
     args = parser.parse_args()
 
@@ -548,10 +655,18 @@ def main():
         window_size=args.window,
     )
 
+    mem_tracer = MemoryTracer() if args.memory_report else None
+
     if args.replay:
         with open(args.replay, "rb") as f:
             run_trace(f, raw_output=args.raw, is_file=True,
-                      detect_loops=args.loops, filter_config=fcfg)
+                      detect_loops=args.loops, filter_config=fcfg,
+                      max_frames=args.max_frames,
+                      max_instructions=args.max_instructions,
+                      memory_tracer=mem_tracer,
+                      show_interrupts=not args.no_interrupts)
+        if mem_tracer:
+            mem_tracer.report(fmt=args.memory_report_format)
         return
 
     if not args.port:
@@ -607,10 +722,16 @@ def main():
     print("Tracing -- Ctrl+C to stop")
     try:
         run_trace(ser, raw_output=args.raw, detect_loops=args.loops,
-                  filter_config=fcfg)
+                  filter_config=fcfg,
+                  max_frames=args.max_frames,
+                  max_instructions=args.max_instructions,
+                  memory_tracer=mem_tracer,
+                  show_interrupts=not args.no_interrupts)
     except KeyboardInterrupt:
         pass
     finally:
+        if mem_tracer:
+            mem_tracer.report(fmt=args.memory_report_format)
         # Send stop command
         try:
             ser.write(b"q")
