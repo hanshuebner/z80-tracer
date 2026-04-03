@@ -206,6 +206,9 @@ static struct {
     // Synchronization: when true, IDLE only accepts M1 cycles
     bool     syncing;
 
+    // Flow control state: true while /WAIT is asserted
+    bool     wait_asserted;
+
     // Sequence counter for gap detection (7-bit, wraps)
     uint8_t  seq;
 } az;
@@ -214,10 +217,12 @@ static struct {
 
 static inline void wait_assert(void) {
     gpio_set_dir(PIN_WAIT, GPIO_OUT);  // drive low
+    az.wait_asserted = true;
 }
 
 static inline void wait_release(void) {
     gpio_set_dir(PIN_WAIT, GPIO_IN);   // release (open-drain)
+    az.wait_asserted = false;
 }
 
 #define HI_WAIT_BIT   (1u << (PIN_WAIT  - 32))
@@ -682,9 +687,14 @@ static void process_sample(uint32_t sample) {
 
 // ---- Core 1 entry point ----
 
+// Diagnostic counters (read by core 0 when tracing stops)
+static volatile uint32_t diag_wait_pauses;
+static volatile uint32_t diag_dma_overflows;
+static volatile uint32_t diag_samples_lost;
+static volatile uint32_t diag_flow_discards;  // samples skipped during flow control
+
 static void core1_main(void) {
     uint32_t tail = 0;
-    bool wait_is_asserted = false;
 
     memset(&az, 0, sizeof(az));
     az.state = ST_IDLE;
@@ -697,7 +707,10 @@ static void core1_main(void) {
             az.state = ST_IDLE;
             az.syncing = true;
             wait_release();
-            wait_is_asserted = false;
+            diag_wait_pauses = 0;
+            diag_dma_overflows = 0;
+            diag_samples_lost = 0;
+            diag_flow_discards = 0;
             needs_reset = false;
         }
 
@@ -709,11 +722,11 @@ static void core1_main(void) {
         if (__builtin_expect(distance > (CAPTURE_BUF_SIZE_WORDS * 3 / 4), 0)
             && distance != 0) {
             // Jump tail forward to head, losing the overwritten samples
-            uint32_t lost = distance;
+            diag_dma_overflows++;
+            diag_samples_lost += distance;
             tail = head;
             az.state = ST_IDLE;
             az.syncing = true;
-            emit_status(STATUS_DMA_OVERFLOW, lost > 0x3FFF ? 0x3FFF : lost);
         }
 
         while (tail != head) {
@@ -724,27 +737,34 @@ static void core1_main(void) {
                     uint32_t level = queue_get_level(&trace_queue);
                     if (level <= FLOW_CTRL_RELEASE_THRESHOLD) {
                         wait_release();
-                        if (wait_is_asserted) {
-                            wait_is_asserted = false;
-                            emit_status(STATUS_WAIT_RELEASE, level);
-                        }
+                        diag_wait_pauses++;
                     }
                 } else {
                     // Queue still full, /WAIT is asserted but CLK keeps
-                    // running — PIO/DMA keep filling the ring buffer with
-                    // repeated wait-state samples.  Skip them all to
-                    // prevent DMA ring overflow.
+                    // running — skip buffered samples.
+                    uint32_t skipped = (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
+                    diag_flow_discards += skipped;
+                    tail = head;
+                    break;
+                }
+            }
+            // /WAIT asserted but no pending record: wait was asserted via
+            // threshold check.  Check if queue has drained enough to release.
+            if (__builtin_expect(az.wait_asserted, 0)) {
+                uint32_t level = queue_get_level(&trace_queue);
+                if (level <= FLOW_CTRL_RELEASE_THRESHOLD) {
+                    wait_release();
+                    diag_wait_pauses++;
+                } else {
+                    // Still above threshold — skip samples
+                    uint32_t skipped = (head - tail) & (CAPTURE_BUF_SIZE_WORDS - 1);
+                    diag_flow_discards += skipped;
                     tail = head;
                     break;
                 }
             }
             process_sample(sample_buf[tail]);
             tail = (tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
-
-            // Detect new /WAIT assertion from emit_record
-            if (__builtin_expect(az.has_pending && !wait_is_asserted, 0)) {
-                wait_is_asserted = true;
-            }
         }
     }
 }
@@ -789,30 +809,24 @@ static bool emit_usb_packet(const trace_record_t *rec) {
     return true;
 }
 
-// ---- USB text I/O ----
-
-static void usb_puts(const char *s) {
-    tud_cdc_write_str(s);
-    tud_cdc_write_flush();
-}
-
 // ---- Capture start / stop ----
 
 static void capture_start(void) {
-    // Signal core 1 to reset state
-    needs_reset = true;
-    while (needs_reset) tight_loop_contents();
-
-    // Reset DMA
-    dma_channel_set_write_addr(dma_chan, sample_buf, false);
-    dma_channel_set_trans_count(dma_chan, 0xFFFFFFFF, false);
-
-    // Reset PIO
+    // Reset PIO + DMA first (stopped state)
+    pio_sm_set_enabled(pio, sm, false);
+    dma_channel_abort(dma_chan);
     pio_sm_clear_fifos(pio, sm);
     pio_sm_restart(pio, sm);
     pio_sm_exec(pio, sm, pio_encode_jmp(pio_offset));
+    dma_channel_set_write_addr(dma_chan, sample_buf, false);
+    dma_channel_set_trans_count(dma_chan, 0xFFFFFFFF, false);
 
-    // Start capture
+    // Signal core 1 to reset its state while DMA is still stopped.
+    // Core 1 sets tail = dma_write_index() = 0 (since DMA was just reset).
+    needs_reset = true;
+    while (needs_reset) tight_loop_contents();
+
+    // Now start capture — core 1's tail is in sync with DMA write pointer.
     dma_channel_start(dma_chan);
     pio_sm_set_enabled(pio, sm, true);
 }
@@ -823,12 +837,29 @@ static void capture_stop(void) {
     wait_release();
 }
 
+// ---- Emit a status-only USB packet directly (core 0, outside trace path) ----
+
+static void send_status(uint8_t subtype, uint16_t count) {
+    uint8_t pkt[USB_PACKET_SIZE];
+    pkt[0] = 0x80 | (CYCLE_STATUS << 3) | (subtype & 0x07);
+    pkt[1] = 0;  // seq high
+    pkt[2] = 0;  // seq low
+    pkt[3] = (count >> 7) & 0x7F;
+    pkt[4] = count & 0x7F;
+    // Wait for space in USB write FIFO, flushing as needed
+    while (tud_cdc_write_available() < USB_PACKET_SIZE) {
+        tud_cdc_write_flush();
+        tud_task();
+    }
+    tud_cdc_write(pkt, USB_PACKET_SIZE);
+}
+
 // ---- Entry point (core 0) ----
 
 int main(void) {
-    // Overclock to 200 MHz for comfortable margin on state machine throughput.
-    // At 4 MHz Z80 (8M samples/sec), this gives 25 cycles/sample vs ~23 needed.
-    set_sys_clock_khz(200000, true);
+    // Overclock to 250 MHz for comfortable margin on state machine throughput.
+    // At 4 MHz Z80 (8M samples/sec), this gives ~31 cycles/sample vs ~23 needed.
+    set_sys_clock_khz(250000, true);
 
     stdio_init_all();
 
@@ -841,9 +872,8 @@ int main(void) {
     // Launch analyzer state machine on core 1
     multicore_launch_core1(core1_main);
 
-    char cmd_buf[32];
-    int cmd_len = 0;
     bool tracing = false;
+    uint8_t cmd_state = 0;  // 0 = idle, 1 = got CMD_SYNC
 
     while (true) {
         tud_task();
@@ -853,56 +883,81 @@ int main(void) {
                 capture_stop();
                 tracing = false;
             }
-            cmd_len = 0;
+            cmd_state = 0;
             continue;
         }
 
-        if (tracing) {
-            // Any incoming byte stops tracing
-            if (tud_cdc_available()) {
-                uint8_t dummy[64];
-                tud_cdc_read(dummy, sizeof(dummy));
-                capture_stop();
-                tracing = false;
+        // Process incoming commands (binary: 0xFF + command byte)
+        while (tud_cdc_available()) {
+            uint8_t ch;
+            tud_cdc_read(&ch, 1);
+            if (cmd_state == 0) {
+                if (ch == CMD_SYNC) cmd_state = 1;
+                // ignore other bytes (e.g. stale data)
+            } else {
+                cmd_state = 0;
+                if (ch == CMD_TRACE_START && !tracing) {
+                    capture_start();
+                    tracing = true;
+                    send_status(STATUS_TRACE_START, 0);
+                    tud_cdc_write_flush();
+                } else if (ch == CMD_TRACE_STOP && tracing) {
+                    capture_stop();
+                    tracing = false;
 
-                // Drain remaining records from queue
+                    // Drain remaining records from queue, handling USB backpressure
+                    trace_record_t rec;
+                    while (queue_try_remove(&trace_queue, &rec)) {
+                        while (!emit_usb_packet(&rec)) {
+                            tud_task();
+                            tud_cdc_write_flush();
+                        }
+                    }
+                    tud_cdc_write_flush();
+                    tud_task();
+
+                    // Emit diagnostic summary — only if events occurred
+                    if (diag_wait_pauses > 0) {
+                        uint16_t wp = diag_wait_pauses > 0x3FFF ? 0x3FFF : diag_wait_pauses;
+                        send_status(STATUS_WAIT_ASSERT, wp);
+                    }
+                    if (diag_dma_overflows > 0) {
+                        uint16_t ov = diag_dma_overflows > 0x3FFF ? 0x3FFF : diag_dma_overflows;
+                        send_status(STATUS_DMA_OVERFLOW, ov);
+                    }
+                    if (diag_flow_discards > 0) {
+                        uint16_t fd = diag_flow_discards > 0x3FFF ? 0x3FFF : diag_flow_discards;
+                        send_status(STATUS_FLOW_DISCARD, fd);
+                    }
+                    // Final stop acknowledgement
+                    send_status(STATUS_TRACE_STOP, 0);
+                    tud_cdc_write_flush();
+                    tud_task();
+                }
+            }
+        }
+
+        if (tracing) {
+            // Drain trace queue to USB
+            static trace_record_t usb_pending;
+            static bool usb_has_pending = false;
+
+            if (usb_has_pending) {
+                if (emit_usb_packet(&usb_pending))
+                    usb_has_pending = false;
+            }
+
+            if (!usb_has_pending) {
                 trace_record_t rec;
                 while (queue_try_remove(&trace_queue, &rec)) {
-                    emit_usb_packet(&rec);
+                    if (!emit_usb_packet(&rec)) {
+                        usb_pending = rec;
+                        usb_has_pending = true;
+                        break;
+                    }
                 }
-                tud_cdc_write_flush();
-                usb_puts("stopped\r\n");
-                continue;
-            }
-
-            // Drain trace queue to USB
-            trace_record_t rec;
-            while (queue_try_remove(&trace_queue, &rec)) {
-                if (!emit_usb_packet(&rec)) break;  // USB full
             }
             tud_cdc_write_flush();
-
-        } else {
-            // Command parsing
-            while (tud_cdc_available()) {
-                uint8_t ch;
-                tud_cdc_read(&ch, 1);
-                if (ch == '\r' || ch == '\n') {
-                    if (cmd_len > 0) {
-                        cmd_buf[cmd_len] = '\0';
-                        if (strcmp(cmd_buf, "trace") == 0) {
-                            usb_puts("tracing\r\n");
-                            capture_start();
-                            tracing = true;
-                        } else {
-                            usb_puts("error: unknown command\r\n");
-                        }
-                        cmd_len = 0;
-                    }
-                } else if (cmd_len < (int)sizeof(cmd_buf) - 1) {
-                    cmd_buf[cmd_len++] = ch;
-                }
-            }
         }
     }
 }

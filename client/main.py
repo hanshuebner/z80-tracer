@@ -43,7 +43,18 @@ MAX_PACKET_SIZE = 6  # with refresh
 STATUS_WAIT_ASSERT = 1
 STATUS_WAIT_RELEASE = 2
 STATUS_DMA_OVERFLOW = 3
-STATUS_NAMES = {1: "WAIT_ASSERT", 2: "WAIT_RELEASE", 3: "DMA_OVERFLOW"}
+STATUS_TRACE_START = 4
+STATUS_TRACE_STOP = 5
+STATUS_FLOW_DISCARD = 6
+STATUS_NAMES = {
+    1: "WAIT_ASSERT", 2: "WAIT_RELEASE", 3: "DMA_OVERFLOW",
+    4: "TRACE_START", 5: "TRACE_STOP", 6: "FLOW_DISCARD",
+}
+
+# Binary command protocol (client → firmware)
+CMD_SYNC = 0xFF
+CMD_TRACE_START = 0x01
+CMD_TRACE_STOP = 0x02
 
 
 def parse_packet(data):
@@ -408,7 +419,8 @@ def format_instruction(instr, reg_changes):
 def run_trace(source: BinaryIO, raw_output=False, is_file=False,
               detect_loops=True, filter_config=None,
               max_frames=None, max_instructions=None,
-              memory_tracer=None, show_interrupts=True):
+              memory_tracer=None, show_interrupts=True,
+              stop_fn=None, watch_ranges=None):
     assembler = InstructionAssembler()
     state = Z80State()
     loop_det = LoopDetector()
@@ -421,9 +433,15 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
     diag_wait_asserts = 0
     diag_wait_releases = 0
     diag_dma_overflows = 0
-    diag_dma_samples_lost = 0
+    diag_flow_discards = 0
+    diag_trace_stopped = False
+    # Watch: list of (start, end) ranges; if set, only show instructions that touch them
+    watching = watch_ranges or []
+    watch_cur = False   # accumulates hits for the instruction being assembled
+    watch_prev = False  # hits for the instruction about to be emitted
 
     buf = bytearray()
+    stopping = False  # True after stop command sent, waiting for TRACE_STOP
 
     try:
         while True:
@@ -457,20 +475,29 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
 
                 frame_count += 1
                 if max_frames is not None and frame_count > max_frames:
-                    raise KeyboardInterrupt
+                    if stop_fn:
+                        stop_fn()
+                    raise StopIteration
 
                 # Handle diagnostic status packets
                 if cycle_type == CYCLE_STATUS:
                     subtype = value  # parse_packet puts subtype in value
                     seq = addr       # parse_packet puts seq in addr
                     count = wait_count  # parse_packet puts count in wait_count
+                    if subtype == STATUS_TRACE_STOP:
+                        diag_trace_stopped = True
+                        raise StopIteration
+                    if subtype == STATUS_TRACE_START:
+                        continue  # already handled in handshake
                     name = STATUS_NAMES.get(subtype, f"UNKNOWN({subtype})")
-                    if subtype == STATUS_WAIT_RELEASE:
-                        diag_wait_asserts += 1
+                    if subtype == STATUS_WAIT_ASSERT:
+                        diag_wait_asserts += count
+                    elif subtype == STATUS_WAIT_RELEASE:
                         diag_wait_releases += 1
                     elif subtype == STATUS_DMA_OVERFLOW:
-                        diag_dma_overflows += 1
-                        diag_dma_samples_lost += count
+                        diag_dma_overflows += count
+                    elif subtype == STATUS_FLOW_DISCARD:
+                        diag_flow_discards += count
                     msg = f"; --- STATUS: {name} seq={seq} count={count} ---"
                     if raw_output:
                         raw_buf.append(msg)
@@ -485,6 +512,19 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                         memory_tracer.record_read(addr)
                     elif cycle_type == CYCLE_MEM_WRITE:
                         memory_tracer.record_write(addr)
+
+                # Check watch ranges — accumulate per instruction
+                if watching and cycle_type in (
+                        CYCLE_OPCODE_FETCH, CYCLE_MEM_READ, CYCLE_MEM_WRITE):
+                    if cycle_type == CYCLE_OPCODE_FETCH:
+                        # New instruction boundary: save current hits for the
+                        # instruction about to be emitted, start fresh
+                        watch_prev = watch_cur
+                        watch_cur = False
+                    for ws, we in watching:
+                        if ws <= addr <= we:
+                            watch_cur = True
+                            break
 
                 if raw_output:
                     ct_name = CYCLE_NAMES[cycle_type] if cycle_type < len(CYCLE_NAMES) else "?"
@@ -540,23 +580,38 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 instr_count += 1
 
                 if max_instructions is not None and instr_count > max_instructions:
-                    raise KeyboardInterrupt
+                    if stop_fn:
+                        stop_fn()
+                    raise StopIteration
 
                 # Loop detection
                 state_key = state.snapshot_key()
                 loop_action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
                 reg_changes = state.format_changed(prev_snap)
 
+                # Watch filter: use watch_prev (set at the OPCODE_FETCH boundary)
+                # for instructions emitted by a new fetch; use watch_cur for
+                # instructions emitted by other events (INTACK, flush).
+                if watching:
+                    if cycle_type == CYCLE_OPCODE_FETCH:
+                        show = watch_prev
+                    else:
+                        show = watch_cur
+                else:
+                    show = True
+
                 if trace_filter:
                     result = trace_filter.evaluate(instr, reg_changes, loop_action)
-                    if result.lines:
+                    if show and result.lines:
                         for line in instr_raw:
                             print(line)
-                    for line in result.lines:
-                        print(line)
+                        for line in result.lines:
+                            print(line)
                     if result.stop:
-                        raise KeyboardInterrupt  # clean exit via existing handler
-                else:
+                        if stop_fn:
+                            stop_fn()
+                        raise StopIteration
+                elif show:
                     if loop_action == "normal":
                         for line in instr_raw:
                             print(line)
@@ -570,39 +625,80 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                         print(format_instruction(instr, reg_changes))
 
     except KeyboardInterrupt:
+        if not stopping and stop_fn:
+            stop_fn()
+            stopping = True
+            # Keep draining until TRACE_STOP or timeout.
+            # Scan quickly — only care about STATUS packets.
+            try:
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    chunk = source.read(16384)
+                    if not chunk:
+                        continue
+                    # Fast scan: look for status packet sync byte (0xBF = type 7)
+                    # Status byte 0 = 0x80 | (7 << 3) | subtype = 0xB8..0xBF
+                    for i in range(len(chunk)):
+                        b = chunk[i]
+                        if b & 0xF8 == 0xB8 and i + MIN_PACKET_SIZE <= len(chunk):
+                            # Candidate status packet
+                            pkt = chunk[i:i+MIN_PACKET_SIZE]
+                            # Verify continuation bytes have bit 7 clear
+                            if all(pkt[j] & 0x80 == 0 for j in range(1, MIN_PACKET_SIZE)):
+                                ct, _, val, _, wc, _ = parse_packet(pkt)
+                                if ct == CYCLE_STATUS:
+                                    if val == STATUS_TRACE_STOP:
+                                        diag_trace_stopped = True
+                                        raise StopIteration
+                                    elif val == STATUS_WAIT_ASSERT:
+                                        diag_wait_asserts += wc
+                                    elif val == STATUS_DMA_OVERFLOW:
+                                        diag_dma_overflows += wc
+                                    elif val == STATUS_FLOW_DISCARD:
+                                        diag_flow_discards += wc
+            except (KeyboardInterrupt, StopIteration):
+                pass
+    except StopIteration:
         pass
 
     # Flush any partial instruction
     instr = assembler.flush()
     if instr:
-        if raw_output:
+        show_flush = not watching or watch_cur
+        if show_flush and raw_output:
             for line in raw_buf:
                 print(line)
-            raw_buf = []
+        raw_buf = []
         prev_snap = state.snapshot_key()
         state.execute(instr)
         instr_count += 1
         state_key = state.snapshot_key()
         action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
         reg_changes = state.format_changed(prev_snap)
-        if action == "loop_exit":
-            summary = loop_det.loop_summary()
-            if summary:
-                print(summary)
-        if action != "suppress":
-            print(format_instruction(instr, reg_changes))
+        if show_flush:
+            if action == "loop_exit":
+                summary = loop_det.loop_summary()
+                if summary:
+                    print(summary)
+            if action != "suppress":
+                print(format_instruction(instr, reg_changes))
 
     if loop_det.in_loop:
         summary = loop_det.loop_summary()
         if summary:
             print(summary)
 
-    print(f"\n--- {instr_count} instructions, {frame_count} frames traced ---")
-    print(state.format_registers())
-    if diag_wait_releases or diag_dma_overflows:
-        print(f"\nDiagnostics: {diag_wait_releases} flow control pauses, "
-              f"{diag_dma_overflows} DMA overflows "
-              f"({diag_dma_samples_lost} samples lost)")
+    print(f"\n--- {instr_count} instructions, {frame_count} frames traced ---",
+          file=sys.stderr)
+    print(state.format_registers(), file=sys.stderr)
+
+    return {
+        "wait_asserts": diag_wait_asserts,
+        "wait_releases": diag_wait_releases,
+        "dma_overflows": diag_dma_overflows,
+        "flow_discards": diag_flow_discards,
+        "trace_stopped": diag_trace_stopped,
+    }
 
 
 # -- Entry point --
@@ -631,6 +727,11 @@ def main():
     parser.add_argument(
         "--hexdump", action="store_true",
         help="Dump raw USB bytes in hex and exit (diagnostic)")
+
+    # Address watching
+    parser.add_argument(
+        "--watch", action="append", default=[], metavar="ADDR|START-END",
+        help="Show instructions that access address or range (repeatable)")
 
     # Filtering and triggering
     parser.add_argument(
@@ -701,17 +802,28 @@ def main():
     )
 
     mem_tracer = MemoryTracer() if args.memory_report else None
+    watch = [parse_address_or_range(w) for w in args.watch]
 
     if args.replay:
         with open(args.replay, "rb") as f:
-            run_trace(f, raw_output=args.raw, is_file=True,
-                      detect_loops=args.loops, filter_config=fcfg,
-                      max_frames=args.max_frames,
-                      max_instructions=args.max_instructions,
-                      memory_tracer=mem_tracer,
-                      show_interrupts=not args.no_interrupts)
+            diag = run_trace(f, raw_output=args.raw, is_file=True,
+                             detect_loops=args.loops, filter_config=fcfg,
+                             max_frames=args.max_frames,
+                             max_instructions=args.max_instructions,
+                             memory_tracer=mem_tracer,
+                             show_interrupts=not args.no_interrupts,
+                             watch_ranges=watch)
         if mem_tracer:
             mem_tracer.report(fmt=args.memory_report_format)
+        wp = diag.get("wait_asserts", 0)
+        do = diag.get("dma_overflows", 0)
+        fd = diag.get("flow_discards", 0)
+        if wp or do or fd:
+            print(f"\nDiagnostics: {wp} flow control pauses, "
+                  f"{do} DMA overflows, {fd} flow control discards")
+            if fd:
+                print("WARNING: samples discarded during flow control — "
+                      "check /WAIT wiring", file=sys.stderr)
         return
 
     if not args.port:
@@ -751,45 +863,87 @@ def main():
     # Drain any stale data
     ser.reset_input_buffer()
 
-    # Send trace command and wait for acknowledgement
-    ser.write(b"trace\n")
-    ser.flush()
-    while True:
-        line = ser.readline()
-        if not line:
-            continue
-        line = line.strip()
-        if line == b"tracing":
-            break
-        if line:
-            print(f"Firmware: {line.decode(errors='replace')}")
+    def send_command(cmd):
+        ser.write(bytes([CMD_SYNC, cmd]))
+        ser.flush()
+
+    # Send binary start command and wait for ack
+    send_command(CMD_TRACE_START)
+    _wait_for_status(ser, STATUS_TRACE_START)
 
     print("Tracing -- Ctrl+C to stop")
-    try:
-        run_trace(ser, raw_output=args.raw, detect_loops=args.loops,
-                  filter_config=fcfg,
-                  max_frames=args.max_frames,
-                  max_instructions=args.max_instructions,
-                  memory_tracer=mem_tracer,
-                  show_interrupts=not args.no_interrupts)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if mem_tracer:
-            mem_tracer.report(fmt=args.memory_report_format)
-        # Send stop command
+
+    def stop_fn():
+        print("Stopping trace...", file=sys.stderr)
+        send_command(CMD_TRACE_STOP)
+
+    diag = run_trace(ser, raw_output=args.raw, detect_loops=args.loops,
+                     filter_config=fcfg,
+                     max_frames=args.max_frames,
+                     max_instructions=args.max_instructions,
+                     memory_tracer=mem_tracer,
+                     show_interrupts=not args.no_interrupts,
+                     stop_fn=stop_fn,
+                     watch_ranges=watch)
+
+    if mem_tracer:
+        mem_tracer.report(fmt=args.memory_report_format)
+
+    wait_pauses = diag.get("wait_asserts", 0)
+    dma_overflows = diag.get("dma_overflows", 0)
+    flow_discards = diag.get("flow_discards", 0)
+    got_stop = diag.get("trace_stopped", False)
+    if got_stop:
+        print(f"Stopped. {wait_pauses} flow control pauses, "
+              f"{dma_overflows} DMA overflows, "
+              f"{flow_discards} flow control discards", file=sys.stderr)
+        if flow_discards:
+            print("WARNING: samples discarded during flow control — "
+                  "check /WAIT wiring", file=sys.stderr)
+    else:
+        # Check if firmware is still sending data
         try:
-            ser.write(b"q")
-            ser.flush()
-            # Read until we see "stopped"
-            for _ in range(20):
-                line = ser.readline()
-                if line and b"stopped" in line:
-                    print("Stopped.")
-                    break
+            probe = ser.read(4096)
+            if probe:
+                print(f"Warning: did not receive stop confirmation "
+                      f"(firmware still sending, {len(probe)} bytes pending)",
+                      file=sys.stderr)
+            else:
+                print(f"Warning: did not receive stop confirmation "
+                      f"(firmware silent — stop ack likely lost in USB)",
+                      file=sys.stderr)
         except Exception:
-            pass
-        ser.close()
+            print("Warning: did not receive stop confirmation from firmware",
+                  file=sys.stderr)
+    ser.close()
+
+
+def _wait_for_status(source, expected_subtype, timeout=5.0):
+    """Read packets until a STATUS packet with the expected subtype arrives."""
+    buf = bytearray()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        chunk = source.read(4096)
+        if not chunk:
+            continue
+        buf.extend(chunk)
+        while len(buf) >= MIN_PACKET_SIZE:
+            if not (buf[0] & 0x80):
+                buf = buf[1:]
+                continue
+            pkt_len = 1
+            while (pkt_len < len(buf)
+                   and pkt_len < MAX_PACKET_SIZE
+                   and not (buf[pkt_len] & 0x80)):
+                pkt_len += 1
+            if pkt_len < MIN_PACKET_SIZE:
+                break
+            pkt = buf[:pkt_len]
+            buf = buf[pkt_len:]
+            ct, _, val, _, _, _ = parse_packet(pkt)
+            if ct == CYCLE_STATUS and val == expected_subtype:
+                return True
+    return False
 
 
 if __name__ == "__main__":

@@ -74,10 +74,20 @@ typedef enum {
     CYCLE_STATUS     = 7,   // Diagnostic status (flow control / overflow)
 } cycle_type_t;
 
-// Status event subtypes (carried in trace_record_t.data for CYCLE_STATUS)
-#define STATUS_WAIT_ASSERT  0x01  // /WAIT asserted (queue backpressure)
+// Status event subtypes (carried in byte 0 bits 2:0 for CYCLE_STATUS packets)
+#define STATUS_WAIT_ASSERT  0x01  // /WAIT asserted (count = total pauses)
 #define STATUS_WAIT_RELEASE 0x02  // /WAIT released
-#define STATUS_DMA_OVERFLOW 0x03  // DMA ring buffer overrun detected
+#define STATUS_DMA_OVERFLOW 0x03  // DMA ring buffer overrun (count = samples lost)
+#define STATUS_TRACE_START  0x04  // Trace started (ack for start command)
+#define STATUS_TRACE_STOP   0x05  // Trace stopped (ack for stop command)
+#define STATUS_FLOW_DISCARD 0x06  // Samples discarded during flow control
+
+// Binary command protocol (client → firmware):
+// Byte 0: 0xFF  (sync — no trace packet has type >= 16)
+// Byte 1: command code
+#define CMD_SYNC          0xFF
+#define CMD_TRACE_START   0x01
+#define CMD_TRACE_STOP    0x02
 
 // Trace record produced by analyzer state machine (core 1 → core 0)
 typedef struct {
