@@ -219,7 +219,7 @@ def test_address_mask():
 
 def test_start_at():
     """Test --start-at trigger."""
-    cfg = FilterConfig(start_at=0x0005)
+    cfg = FilterConfig(start_at=[(0x0005, 0x0005)])
     h = FilterHarness(cfg)
 
     for addr in range(10):
@@ -234,9 +234,27 @@ def test_start_at():
     print("Start-at trigger test passed!")
 
 
+def test_start_at_range():
+    """Test --start-at with address range trigger."""
+    cfg = FilterConfig(start_at=[(0x0003, 0x0006)])
+    h = FilterHarness(cfg)
+
+    for addr in range(10):
+        h.feed(CYCLE_OPCODE_FETCH, addr, 0x00)
+    h.flush()
+
+    output = "\n".join(h.output_lines)
+    assert "TRIGGER" in output, "Should show trigger event"
+    assert "$0003-$0006" in output, "Should show range in trigger message"
+    assert "0003:" in output, "Should show first addr in range"
+    assert "0005:" in output, "Should show addr in range"
+    assert "0001:" not in output, "Should NOT show addr before range"
+    print("Start-at range trigger test passed!")
+
+
 def test_start_at_with_window():
     """Test --start-at with --window for pre-trigger context."""
-    cfg = FilterConfig(start_at=0x0005, window_size=3)
+    cfg = FilterConfig(start_at=[(0x0005, 0x0005)], window_size=3)
     h = FilterHarness(cfg)
 
     for addr in range(10):
@@ -328,6 +346,7 @@ if __name__ == "__main__":
     print()
     test_address_mask()
     test_start_at()
+    test_start_at_range()
     test_start_at_with_window()
     test_limit()
     test_mem_write_trigger()

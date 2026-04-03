@@ -20,7 +20,7 @@ from typing import Optional, BinaryIO
 from . import z80_decoder as dec
 from .z80_state import Z80State
 from .z80_loop import LoopDetector
-from .trace_filter import TraceFilter, FilterConfig, parse_address_range, parse_trigger_addr
+from .trace_filter import TraceFilter, FilterConfig, parse_address_range, parse_address_or_range, parse_trigger_addr
 
 
 # -- Wire protocol (matches firmware z80_trace.h) --
@@ -319,6 +319,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
     assembler = InstructionAssembler()
     state = Z80State()
     loop_det = LoopDetector()
+    raw_buf = []  # buffered raw cycle lines, flushed with their decoded instruction
     trace_filter = (TraceFilter(filter_config, format_instruction)
                     if filter_config and filter_config.has_any_config else None)
     instr_count = 0
@@ -364,10 +365,15 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                         extras += f" W={wait_count}"
                     if halt:
                         extras += " HALT"
-                    print(f"  {ct_name:6s} {addr:04X} {value:02X}{extras}")
+                    raw_buf.append(f"  {ct_name:6s} {addr:04X} {value:02X}{extras}")
+
+                # Check if filter has already stopped tracing
+                filter_active = (not trace_filter or trace_filter._active)
 
                 if cycle_type == CYCLE_RESET:
-                    print(f"; --- RESET ---")
+                    raw_buf.clear()
+                    if filter_active:
+                        print(f"; --- RESET ---")
                     continue
 
                 instr = assembler.feed(cycle_type, addr, value)
@@ -376,13 +382,27 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 if assembler.int_ack:
                     iaddr, ivec = assembler.int_ack
                     assembler.int_ack = None
-                    print(f"; --- INT acknowledge at ${iaddr:04X}, vector=${ivec:02X} ---")
+                    if filter_active:
+                        print(f"; --- INT acknowledge at ${iaddr:04X}, vector=${ivec:02X} ---")
                 if assembler.nmi_detected:
                     assembler.nmi_detected = False
-                    print(f"; --- NMI ---")
+                    if filter_active:
+                        print(f"; --- NMI ---")
 
                 if instr is None:
                     continue
+
+                # Split raw lines: if triggered by an opcode fetch, the last
+                # raw line belongs to the *next* instruction — carry it over.
+                if raw_output:
+                    if cycle_type == CYCLE_OPCODE_FETCH:
+                        instr_raw = raw_buf[:-1]
+                        raw_buf = raw_buf[-1:]
+                    else:
+                        instr_raw = raw_buf
+                        raw_buf = []
+                else:
+                    instr_raw = []
 
                 # Take state snapshot before execution
                 prev_snap = state.snapshot_key()
@@ -396,17 +416,24 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
 
                 if trace_filter:
                     result = trace_filter.evaluate(instr, reg_changes, loop_action)
+                    if result.lines:
+                        for line in instr_raw:
+                            print(line)
                     for line in result.lines:
                         print(line)
                     if result.stop:
                         raise KeyboardInterrupt  # clean exit via existing handler
                 else:
                     if loop_action == "normal":
+                        for line in instr_raw:
+                            print(line)
                         print(format_instruction(instr, reg_changes))
                     elif loop_action == "loop_exit":
                         summary = loop_det.loop_summary()
                         if summary:
                             print(summary)
+                        for line in instr_raw:
+                            print(line)
                         print(format_instruction(instr, reg_changes))
 
     except KeyboardInterrupt:
@@ -415,6 +442,10 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
     # Flush any partial instruction
     instr = assembler.flush()
     if instr:
+        if raw_output:
+            for line in raw_buf:
+                print(line)
+            raw_buf = []
         prev_snap = state.snapshot_key()
         state.execute(instr)
         instr_count += 1
@@ -466,8 +497,8 @@ def main():
         "--mask", action="append", default=[], metavar="START-END",
         help="Suppress output for PC in range (e.g., 0xF000-0xFFFF)")
     parser.add_argument(
-        "--start-at", type=lambda x: int(x, 0), default=None, metavar="ADDR",
-        help="Start tracing when PC reaches this address")
+        "--start-at", action="append", default=[], metavar="ADDR|START-END",
+        help="Start tracing when PC reaches address or enters range (repeatable)")
     parser.add_argument(
         "--stop-at", type=lambda x: int(x, 0), default=None, metavar="ADDR",
         help="Stop tracing when PC reaches this address")
@@ -504,7 +535,7 @@ def main():
     # Build filter config from args
     fcfg = FilterConfig(
         address_masks=[parse_address_range(m) for m in args.mask],
-        start_at=args.start_at,
+        start_at=[parse_address_or_range(s) for s in args.start_at],
         stop_at=args.stop_at,
         start_on=args.start_on,
         stop_on=args.stop_on,

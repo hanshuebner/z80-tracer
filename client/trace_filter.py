@@ -25,6 +25,14 @@ def parse_address_range(s):
     return (int(parts[0], 0), int(parts[1], 0))
 
 
+def parse_address_or_range(s):
+    """Parse '0x100' into (0x100, 0x100) or '0x100-0x200' into (0x100, 0x200)."""
+    if "-" in s:
+        return parse_address_range(s)
+    addr = int(s, 0)
+    return (addr, addr)
+
+
 def parse_trigger_addr(s):
     """Parse '0xC000' or '0xC000=0xFF' into (addr, value_or_None)."""
     if "=" in s:
@@ -38,7 +46,7 @@ def parse_trigger_addr(s):
 @dataclass
 class FilterConfig:
     address_masks: list = field(default_factory=list)       # [(start, end), ...]
-    start_at: int = None
+    start_at: list = field(default_factory=list)   # [(start, end), ...]
     stop_at: int = None
     start_on: str = None          # mnemonic regex pattern
     stop_on: str = None           # mnemonic regex pattern
@@ -54,7 +62,7 @@ class FilterConfig:
     def has_triggers(self):
         """True if any start triggers are defined."""
         return any([
-            self.start_at is not None,
+            self.start_at,
             self.start_on,
             self.mem_read_triggers,
             self.mem_write_triggers,
@@ -134,6 +142,7 @@ class TraceFilter:
             self._active = False
             self._flush_mask_summary(action)
             action.lines.append(f"; === STOP ===")
+            action.stop = True
             self._update_prev(instr)
             return action
 
@@ -171,9 +180,12 @@ class TraceFilter:
         """Check all start triggers. Returns description string or None."""
         cfg = self._config
 
-        # PC-based
-        if cfg.start_at is not None and instr.pc == cfg.start_at:
-            return f"PC = ${instr.pc:04X}"
+        # PC-based (single address or range)
+        for start, end in cfg.start_at:
+            if start <= instr.pc <= end:
+                if start == end:
+                    return f"PC = ${instr.pc:04X}"
+                return f"PC = ${instr.pc:04X} (in ${start:04X}-${end:04X})"
 
         # Mnemonic-based
         if cfg.start_on and re.search(cfg.start_on, instr.mnemonic, re.IGNORECASE):
