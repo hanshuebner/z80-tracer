@@ -34,28 +34,32 @@ CYCLE_INT_ACK = 5
 CYCLE_RESET = 6
 
 CYCLE_NAMES = ("FETCH", "MREAD", "MWRIT", "IOREAD", "IOWRIT", "INTACK", "RESET")
-PACKET_SIZE = 6
+MIN_PACKET_SIZE = 5  # without refresh
+MAX_PACKET_SIZE = 6  # with refresh
 
 
 def parse_packet(data):
-    """Parse a 6-byte trace packet with bit-7 sync framing.
+    """Parse a 5- or 6-byte trace packet with bit-7 sync framing.
 
-    Format:
+    5-byte packet:
       Byte 0: 1TTTT_AAA  sync=1, type[3:0], addr[15:13]
       Byte 1: 0AAAAAAA   addr[12:6]
       Byte 2: 0AAAAAAD   addr[5:0], data[7]
       Byte 3: 0DDDDDDD   data[6:0]
-      Byte 4: 0RRRRRRR   refresh[6:0]
-      Byte 5: 0HWWWWWW   halt, wait_count[5:0]
+      Byte 4: 0HWWWWWW   halt, wait_count[5:0]
+
+    6-byte packet (with refresh):
+      Bytes 0-4: same as above
+      Byte 5: 0RRRRRRR   refresh[6:0]
 
     Returns (cycle_type, addr, value, refresh, wait_count, halt).
     """
     cycle_type = (data[0] >> 3) & 0x0F
     addr = ((data[0] & 0x07) << 13) | (data[1] << 6) | (data[2] >> 1)
     value = ((data[2] & 0x01) << 7) | data[3]
-    refresh = data[4] & 0x7F
-    halt = bool(data[5] & 0x40)
-    wait_count = data[5] & 0x3F
+    halt = bool(data[4] & 0x40)
+    wait_count = data[4] & 0x3F
+    refresh = data[5] & 0x7F if len(data) > 5 else 0
     return cycle_type, addr, value, refresh, wait_count, halt
 
 
@@ -332,15 +336,22 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
 
             buf.extend(chunk)
 
-            while len(buf) >= PACKET_SIZE:
+            while len(buf) >= MIN_PACKET_SIZE:
                 # Sync: skip bytes until we find one with bit 7 set (packet start)
                 while buf and not (buf[0] & 0x80):
                     buf = buf[1:]
-                if len(buf) < PACKET_SIZE:
+                if len(buf) < MIN_PACKET_SIZE:
                     break
 
-                pkt = buf[:PACKET_SIZE]
-                buf = buf[PACKET_SIZE:]
+                # Count continuation bytes (bit 7 clear) to determine packet length
+                pkt_len = 1
+                while pkt_len < len(buf) and pkt_len < MAX_PACKET_SIZE and not (buf[pkt_len] & 0x80):
+                    pkt_len += 1
+                if pkt_len < MIN_PACKET_SIZE:
+                    break  # need more data
+
+                pkt = buf[:pkt_len]
+                buf = buf[pkt_len:]
 
                 cycle_type, addr, value, refresh, wait_count, halt = parse_packet(pkt)
 

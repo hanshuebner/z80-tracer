@@ -29,12 +29,11 @@ class Z80BusGen:
         self.pc = 0
         self.sp = 0  # track SP for push/pop/call/ret generation
 
-    def _pkt(self, cycle_type, addr, data, refresh=0, wait_count=0, halt=False):
+    def _pkt(self, cycle_type, addr, data, wait_count=0, halt=False):
         self.packets.append(0x80 | ((cycle_type & 0x0F) << 3) | ((addr >> 13) & 0x07))
         self.packets.append((addr >> 6) & 0x7F)
         self.packets.append(((addr & 0x3F) << 1) | ((data >> 7) & 0x01))
         self.packets.append(data & 0x7F)
-        self.packets.append(refresh & 0x7F)
         self.packets.append((0x40 if halt else 0) | (wait_count & 0x3F))
 
     def fetch(self, opcode, addr=None):
@@ -456,7 +455,7 @@ def main():
     data = generate()
     sys.stdout.buffer.write(data)
     sys.stderr.write(f"Generated {len(data)} bytes "
-                     f"({len(data) // 6} bus cycles)\n")
+                     f"({len(data) // 5} bus cycles)\n")
 
 
 if __name__ == "__main__":

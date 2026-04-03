@@ -104,15 +104,23 @@ static inline uint8_t sample_data(uint32_t sample) {
 #define CAPTURE_BUF_SIZE_BYTES  (1u << CAPTURE_BUF_RING_BITS)
 #define CAPTURE_BUF_SIZE_WORDS  (CAPTURE_BUF_SIZE_BYTES / sizeof(uint32_t))
 
-// USB CDC output packet format (binary, 6 bytes with bit-7 sync):
+// USB CDC output packet format (binary, bit-7 sync framing):
+// Only byte 0 has bit 7 set — scan for it to resync mid-stream.
+//
+// 5-byte packet (default):
 //   Byte 0:  1TTTT_AAA   bit7=1 (sync), bits 6-3 = cycle_type, bits 2-0 = addr[15:13]
 //   Byte 1:  0AAA_AAAA   bits 6-0 = addr[12:6]
 //   Byte 2:  0AAA_AAAD   bits 6-1 = addr[5:0], bit 0 = data[7]
 //   Byte 3:  0DDD_DDDD   bits 6-0 = data[6:0]
-//   Byte 4:  0RRR_RRRR   bits 6-0 = refresh[6:0]
-//   Byte 5:  0HWW_WWWW   bit 6 = halt, bits 5-0 = wait_count[5:0]
-// Only byte 0 has bit 7 set — scan for it to resync mid-stream.
-#define USB_PACKET_SIZE 6
+//   Byte 4:  0HWW_WWWW   bit 6 = halt, bits 5-0 = wait_count[5:0]
+//
+// 6-byte packet (with refresh, optional):
+//   Bytes 0-4: same as above
+//   Byte 5:  0RRR_RRRR   bits 6-0 = refresh[6:0] (M1 only)
+//
+// Client distinguishes format by counting continuation bytes (bit 7 clear)
+// between sync markers.
+#define USB_PACKET_SIZE 5
 
 // Flow control thresholds (trace record queue entries)
 #define TRACE_QUEUE_SIZE            256

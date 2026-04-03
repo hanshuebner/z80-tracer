@@ -746,8 +746,7 @@ static bool emit_usb_packet(const trace_record_t *rec) {
     pkt[1] = (addr >> 6) & 0x7F;
     pkt[2] = ((addr & 0x3F) << 1) | ((data >> 7) & 0x01);
     pkt[3] = data & 0x7F;
-    pkt[4] = rec->refresh & 0x7F;
-    pkt[5] = ((rec->flags & TRACE_FLAG_HALT) ? 0x40 : 0)
+    pkt[4] = ((rec->flags & TRACE_FLAG_HALT) ? 0x40 : 0)
            | (rec->wait_count & 0x3F);
 
     tud_cdc_write(pkt, USB_PACKET_SIZE);
