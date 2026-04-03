@@ -33,29 +33,44 @@ CYCLE_IO_READ = 3
 CYCLE_IO_WRITE = 4
 CYCLE_INT_ACK = 5
 CYCLE_RESET = 6
+CYCLE_STATUS = 7        # Diagnostic status packet
 
-CYCLE_NAMES = ("FETCH", "MREAD", "MWRIT", "IOREAD", "IOWRIT", "INTACK", "RESET")
+CYCLE_NAMES = ("FETCH", "MREAD", "MWRIT", "IOREAD", "IOWRIT", "INTACK", "RESET", "STATUS")
 MIN_PACKET_SIZE = 5  # without refresh
 MAX_PACKET_SIZE = 6  # with refresh
+
+# Status subtypes (in byte 0 bits 2:0 for CYCLE_STATUS packets)
+STATUS_WAIT_ASSERT = 1
+STATUS_WAIT_RELEASE = 2
+STATUS_DMA_OVERFLOW = 3
+STATUS_NAMES = {1: "WAIT_ASSERT", 2: "WAIT_RELEASE", 3: "DMA_OVERFLOW"}
 
 
 def parse_packet(data):
     """Parse a 5- or 6-byte trace packet with bit-7 sync framing.
 
-    5-byte packet:
+    Normal packets (5 or 6 bytes, cycle_type 0-6):
       Byte 0: 1TTTT_AAA  sync=1, type[3:0], addr[15:13]
       Byte 1: 0AAAAAAA   addr[12:6]
       Byte 2: 0AAAAAAD   addr[5:0], data[7]
       Byte 3: 0DDDDDDD   data[6:0]
       Byte 4: 0HWWWWWW   halt, wait_count[5:0]
+      Byte 5 (M1 only): 0RRRRRRR  refresh[6:0]
 
-    6-byte packet (with refresh):
-      Bytes 0-4: same as above
-      Byte 5: 0RRRRRRR   refresh[6:0]
+    Status packets (5 bytes, cycle_type 7):
+      Byte 0: 1_0111_SSS  type=7, subtype[2:0]
+      Byte 1-2: seq[13:0] (14-bit, 7 bits each)
+      Byte 3-4: count[13:0] (14-bit, 7 bits each)
 
     Returns (cycle_type, addr, value, refresh, wait_count, halt).
+    For status packets: addr=seq, value=subtype, refresh=0, wait_count=count, halt=False.
     """
     cycle_type = (data[0] >> 3) & 0x0F
+    if cycle_type == CYCLE_STATUS:
+        subtype = data[0] & 0x07
+        seq = (data[1] << 7) | data[2]
+        count = (data[3] << 7) | data[4]
+        return cycle_type, seq, subtype, 0, count, False
     addr = ((data[0] & 0x07) << 13) | (data[1] << 6) | (data[2] >> 1)
     value = ((data[2] & 0x01) << 7) | data[3]
     halt = bool(data[4] & 0x40)
@@ -402,6 +417,11 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                     if filter_config and filter_config.has_any_config else None)
     instr_count = 0
     frame_count = 0
+    # Diagnostic counters
+    diag_wait_asserts = 0
+    diag_wait_releases = 0
+    diag_dma_overflows = 0
+    diag_dma_samples_lost = 0
 
     buf = bytearray()
 
@@ -439,8 +459,29 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 if max_frames is not None and frame_count > max_frames:
                     raise KeyboardInterrupt
 
+                # Handle diagnostic status packets
+                if cycle_type == CYCLE_STATUS:
+                    subtype = value  # parse_packet puts subtype in value
+                    seq = addr       # parse_packet puts seq in addr
+                    count = wait_count  # parse_packet puts count in wait_count
+                    name = STATUS_NAMES.get(subtype, f"UNKNOWN({subtype})")
+                    if subtype == STATUS_WAIT_RELEASE:
+                        diag_wait_asserts += 1
+                        diag_wait_releases += 1
+                    elif subtype == STATUS_DMA_OVERFLOW:
+                        diag_dma_overflows += 1
+                        diag_dma_samples_lost += count
+                    msg = f"; --- STATUS: {name} seq={seq} count={count} ---"
+                    if raw_output:
+                        raw_buf.append(msg)
+                    else:
+                        print(msg, file=sys.stderr)
+                    continue
+
                 if memory_tracer:
-                    if cycle_type in (CYCLE_OPCODE_FETCH, CYCLE_MEM_READ):
+                    if cycle_type == CYCLE_OPCODE_FETCH:
+                        memory_tracer.record_fetch(addr)
+                    elif cycle_type == CYCLE_MEM_READ:
                         memory_tracer.record_read(addr)
                     elif cycle_type == CYCLE_MEM_WRITE:
                         memory_tracer.record_write(addr)
@@ -558,6 +599,10 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
 
     print(f"\n--- {instr_count} instructions, {frame_count} frames traced ---")
     print(state.format_registers())
+    if diag_wait_releases or diag_dma_overflows:
+        print(f"\nDiagnostics: {diag_wait_releases} flow control pauses, "
+              f"{diag_dma_overflows} DMA overflows "
+              f"({diag_dma_samples_lost} samples lost)")
 
 
 # -- Entry point --

@@ -71,7 +71,13 @@ typedef enum {
     CYCLE_IO_WRITE   = 4,   // I/O write
     CYCLE_INT_ACK    = 5,   // Interrupt acknowledge
     CYCLE_RESET      = 6,   // Reset (emitted when /RESET releases)
+    CYCLE_STATUS     = 7,   // Diagnostic status (flow control / overflow)
 } cycle_type_t;
+
+// Status event subtypes (carried in trace_record_t.data for CYCLE_STATUS)
+#define STATUS_WAIT_ASSERT  0x01  // /WAIT asserted (queue backpressure)
+#define STATUS_WAIT_RELEASE 0x02  // /WAIT released
+#define STATUS_DMA_OVERFLOW 0x03  // DMA ring buffer overrun detected
 
 // Trace record produced by analyzer state machine (core 1 → core 0)
 typedef struct {
@@ -81,7 +87,7 @@ typedef struct {
     uint8_t  refresh;       // A[6:0] refresh address (M1_FETCH only)
     uint8_t  wait_count;    // number of wait states (includes auto-waits for I/O)
     uint8_t  flags;         // TRACE_FLAG_*
-    uint8_t  _pad;
+    uint8_t  seq;           // Sequence counter (7-bit, wraps), for gap detection
 } trace_record_t;
 
 #define TRACE_FLAG_HALT  (1u << 0)  // CPU is halted
@@ -107,19 +113,28 @@ static inline uint8_t sample_data(uint32_t sample) {
 // USB CDC output packet format (binary, bit-7 sync framing):
 // Only byte 0 has bit 7 set — scan for it to resync mid-stream.
 //
-// 5-byte packet (default):
+// Normal packets (5 or 6 bytes, cycle_type 0-6):
 //   Byte 0:  1TTTT_AAA   bit7=1 (sync), bits 6-3 = cycle_type, bits 2-0 = addr[15:13]
 //   Byte 1:  0AAA_AAAA   bits 6-0 = addr[12:6]
 //   Byte 2:  0AAA_AAAD   bits 6-1 = addr[5:0], bit 0 = data[7]
 //   Byte 3:  0DDD_DDDD   bits 6-0 = data[6:0]
 //   Byte 4:  0HWW_WWWW   bit 6 = halt, bits 5-0 = wait_count[5:0]
+//   Byte 5 (M1 only): 0RRR_RRRR  bits 6-0 = refresh[6:0]
 //
-// 6-byte packet (with refresh, optional):
-//   Bytes 0-4: same as above
-//   Byte 5:  0RRR_RRRR   bits 6-0 = refresh[6:0] (M1 only)
+// Status packets (5 bytes, cycle_type 7 = CYCLE_STATUS):
+//   Byte 0:  1_0111_SSS  bit7=1, type=7, bits 2-0 = subtype[2:0]
+//   Byte 1:  0SSS_SSSS   bits 6-0 = seq[13:7]  (record sequence counter)
+//   Byte 2:  0SSS_SSSS   bits 6-0 = seq[6:0]
+//   Byte 3:  0CCC_CCCC   bits 6-0 = count[13:7] (event-specific counter)
+//   Byte 4:  0CCC_CCCC   bits 6-0 = count[6:0]
 //
-// Client distinguishes format by counting continuation bytes (bit 7 clear)
-// between sync markers.
+// Subtypes (in byte 0 bits 2-0):
+//   1 = WAIT asserted (backpressure), count = queue level
+//   2 = WAIT released, count = queue level
+//   3 = DMA ring buffer overrun, count = samples lost
+//
+// The 14-bit sequence counter increments for every record emitted and wraps.
+// Client detects gaps by checking for non-consecutive sequence numbers.
 #define USB_PACKET_SIZE 5
 
 // Flow control thresholds (trace record queue entries)
