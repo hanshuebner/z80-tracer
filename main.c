@@ -771,6 +771,8 @@ static void core1_main(void) {
 
 // ---- USB output ----
 
+static uint32_t usb_frames_sent;  // total non-status frames emitted over USB
+
 static bool emit_usb_packet(const trace_record_t *rec) {
     if (tud_cdc_write_available() < USB_PACKET_SIZE) return false;
 
@@ -806,6 +808,7 @@ static bool emit_usb_packet(const trace_record_t *rec) {
         len = 6;
     }
     tud_cdc_write(pkt, len);
+    usb_frames_sent++;
     return true;
 }
 
@@ -820,6 +823,8 @@ static void capture_start(void) {
     pio_sm_exec(pio, sm, pio_encode_jmp(pio_offset));
     dma_channel_set_write_addr(dma_chan, sample_buf, false);
     dma_channel_set_trans_count(dma_chan, 0xFFFFFFFF, false);
+
+    usb_frames_sent = 0;
 
     // Signal core 1 to reset its state while DMA is still stopped.
     // Core 1 sets tail = dma_write_index() = 0 (since DMA was just reset).
@@ -838,6 +843,8 @@ static void capture_stop(void) {
 }
 
 // ---- Emit a status-only USB packet directly (core 0, outside trace path) ----
+// For most subtypes, count is 14-bit.  For STATUS_FRAMES_SENT, the 28-bit
+// value is split: seq field = high 14 bits, count field = low 14 bits.
 
 static void send_status(uint8_t subtype, uint16_t count) {
     uint8_t pkt[USB_PACKET_SIZE];
@@ -847,6 +854,23 @@ static void send_status(uint8_t subtype, uint16_t count) {
     pkt[3] = (count >> 7) & 0x7F;
     pkt[4] = count & 0x7F;
     // Wait for space in USB write FIFO, flushing as needed
+    while (tud_cdc_write_available() < USB_PACKET_SIZE) {
+        tud_cdc_write_flush();
+        tud_task();
+    }
+    tud_cdc_write(pkt, USB_PACKET_SIZE);
+}
+
+// Send a 28-bit value: high 14 bits in seq field, low 14 bits in count field
+static void send_status_wide(uint8_t subtype, uint32_t value) {
+    uint8_t pkt[USB_PACKET_SIZE];
+    uint16_t hi = (value >> 14) & 0x3FFF;
+    uint16_t lo = value & 0x3FFF;
+    pkt[0] = 0x80 | (CYCLE_STATUS << 3) | (subtype & 0x07);
+    pkt[1] = (hi >> 7) & 0x7F;
+    pkt[2] = hi & 0x7F;
+    pkt[3] = (lo >> 7) & 0x7F;
+    pkt[4] = lo & 0x7F;
     while (tud_cdc_write_available() < USB_PACKET_SIZE) {
         tud_cdc_write_flush();
         tud_task();
@@ -929,6 +953,8 @@ int main(void) {
                         uint16_t fd = diag_flow_discards > 0x3FFF ? 0x3FFF : diag_flow_discards;
                         send_status(STATUS_FLOW_DISCARD, fd);
                     }
+                    // Always send total frames so client can detect USB loss
+                    send_status_wide(STATUS_FRAMES_SENT, usb_frames_sent);
                     // Final stop acknowledgement
                     send_status(STATUS_TRACE_STOP, 0);
                     tud_cdc_write_flush();

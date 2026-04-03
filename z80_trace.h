@@ -81,6 +81,7 @@ typedef enum {
 #define STATUS_TRACE_START  0x04  // Trace started (ack for start command)
 #define STATUS_TRACE_STOP   0x05  // Trace stopped (ack for stop command)
 #define STATUS_FLOW_DISCARD 0x06  // Samples discarded during flow control
+#define STATUS_FRAMES_SENT  0x07  // Total trace frames sent (28-bit: seq=high14, count=low14)
 
 // Binary command protocol (client → firmware):
 // Byte 0: 0xFF  (sync — no trace packet has type >= 16)

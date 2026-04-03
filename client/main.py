@@ -46,9 +46,11 @@ STATUS_DMA_OVERFLOW = 3
 STATUS_TRACE_START = 4
 STATUS_TRACE_STOP = 5
 STATUS_FLOW_DISCARD = 6
+STATUS_FRAMES_SENT = 7
 STATUS_NAMES = {
     1: "WAIT_ASSERT", 2: "WAIT_RELEASE", 3: "DMA_OVERFLOW",
     4: "TRACE_START", 5: "TRACE_STOP", 6: "FLOW_DISCARD",
+    7: "FRAMES_SENT",
 }
 
 # Binary command protocol (client → firmware)
@@ -434,6 +436,7 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
     diag_wait_releases = 0
     diag_dma_overflows = 0
     diag_flow_discards = 0
+    diag_fw_frames_sent = 0   # total frames firmware reports sending
     diag_trace_stopped = False
     # Watch: list of (start, end) ranges; if set, only show instructions that touch them
     watching = watch_ranges or []
@@ -498,6 +501,9 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                         diag_dma_overflows += count
                     elif subtype == STATUS_FLOW_DISCARD:
                         diag_flow_discards += count
+                    elif subtype == STATUS_FRAMES_SENT:
+                        # 28-bit value: seq=high14, count=low14
+                        diag_fw_frames_sent = (seq << 14) | count
                     msg = f"; --- STATUS: {name} seq={seq} count={count} ---"
                     if raw_output:
                         raw_buf.append(msg)
@@ -656,6 +662,10 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                                         diag_dma_overflows += wc
                                     elif val == STATUS_FLOW_DISCARD:
                                         diag_flow_discards += wc
+                                    elif val == STATUS_FRAMES_SENT:
+                                        # Re-parse: need seq (addr) field
+                                        _, sq, _, _, ct2, _ = parse_packet(pkt)
+                                        diag_fw_frames_sent = (sq << 14) | ct2
             except (KeyboardInterrupt, StopIteration):
                 pass
     except StopIteration:
@@ -697,6 +707,8 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
         "wait_releases": diag_wait_releases,
         "dma_overflows": diag_dma_overflows,
         "flow_discards": diag_flow_discards,
+        "fw_frames_sent": diag_fw_frames_sent,
+        "frames_received": frame_count,
         "trace_stopped": diag_trace_stopped,
     }
 
@@ -818,12 +830,19 @@ def main():
         wp = diag.get("wait_asserts", 0)
         do = diag.get("dma_overflows", 0)
         fd = diag.get("flow_discards", 0)
+        fw_sent = diag.get("fw_frames_sent", 0)
+        rx_frames = diag.get("frames_received", 0)
         if wp or do or fd:
             print(f"\nDiagnostics: {wp} flow control pauses, "
                   f"{do} DMA overflows, {fd} flow control discards")
-            if fd:
-                print("WARNING: samples discarded during flow control — "
-                      "check /WAIT wiring", file=sys.stderr)
+        if fw_sent > 0:
+            usb_lost = fw_sent - rx_frames
+            if usb_lost > 0:
+                print(f"Firmware sent {fw_sent} frames, client received {rx_frames}"
+                      f" — {usb_lost} lost in USB/serial ({usb_lost*100//fw_sent}%)")
+        if fd:
+            print("WARNING: samples discarded during flow control — "
+                  "check /WAIT wiring", file=sys.stderr)
         return
 
     if not args.port:
@@ -892,11 +911,20 @@ def main():
     wait_pauses = diag.get("wait_asserts", 0)
     dma_overflows = diag.get("dma_overflows", 0)
     flow_discards = diag.get("flow_discards", 0)
+    fw_sent = diag.get("fw_frames_sent", 0)
+    rx_frames = diag.get("frames_received", 0)
     got_stop = diag.get("trace_stopped", False)
     if got_stop:
         print(f"Stopped. {wait_pauses} flow control pauses, "
               f"{dma_overflows} DMA overflows, "
               f"{flow_discards} flow control discards", file=sys.stderr)
+        if fw_sent > 0:
+            usb_lost = fw_sent - rx_frames
+            print(f"Firmware sent {fw_sent} frames, client received {rx_frames}"
+                  f" — {usb_lost} lost in USB/serial ({usb_lost*100//fw_sent}%)"
+                  if usb_lost > 0 else
+                  f"Firmware sent {fw_sent} frames, client received all",
+                  file=sys.stderr)
         if flow_discards:
             print("WARNING: samples discarded during flow control — "
                   "check /WAIT wiring", file=sys.stderr)
