@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "hardware/clocks.h"
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
 #include "hardware/pio.h"
@@ -750,6 +751,10 @@ static void capture_stop(void) {
 // ---- Entry point (core 0) ----
 
 int main(void) {
+    // Overclock to 200 MHz for comfortable margin on state machine throughput.
+    // At 4 MHz Z80 (8M samples/sec), this gives 25 cycles/sample vs ~23 needed.
+    set_sys_clock_khz(200000, true);
+
     stdio_init_all();
 
     queue_init(&trace_queue, sizeof(trace_record_t), TRACE_QUEUE_SIZE);
