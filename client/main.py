@@ -634,7 +634,7 @@ def main():
         "--memory-report", action="store_true",
         help="Track memory access and print report on exit")
     parser.add_argument(
-        "--memory-report-format", default="text", metavar="FMT",
+        "--memory-report-format", default="text", choices=["text"],
         help="Memory report format (default: text)")
 
     args = parser.parse_args()
