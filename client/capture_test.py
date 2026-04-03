@@ -47,11 +47,11 @@ def run_diagnostics(ser, duration):
     """Run all diagnostic modes to isolate the bottleneck."""
     status = capture.get_status(ser)
     cpu_mhz = status['cpu_clock_khz'] / 1000
-    budget = cpu_mhz * 1e6 / 8e6
+    budget = cpu_mhz * 1e6 / 4e6
 
     print(f"=== Performance Diagnostics ({duration}s each) ===")
     print(f"    CPU clock: {cpu_mhz:.0f} MHz")
-    print(f"    Expected: 8M samples/sec at 4MHz Z80 → {budget:.1f} cycles/sample budget")
+    print(f"    Expected: 4M samples/sec at 4MHz Z80 (GPIO-polled, rising-edge) → {budget:.1f} cycles/sample budget")
 
     run_diag_mode(ser, capture.DIAG_SKIP_BOTH,
                   "Mode 3: Skip all (DMA read baseline)", duration, cpu_mhz)

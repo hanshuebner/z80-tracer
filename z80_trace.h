@@ -98,12 +98,6 @@ static inline uint8_t sample_data(uint32_t sample) {
     return (sample & SAMPLE_DATA_MASK) >> SAMPLE_DATA_SHIFT;
 }
 
-// --- Ring buffer for DMA capture ---
-// Must be power-of-2 sized and aligned for DMA ring mode.
-#define CAPTURE_BUF_RING_BITS   15            // log2(32KB) = 15 — max DMA ring size
-#define CAPTURE_BUF_SIZE_BYTES  (1u << CAPTURE_BUF_RING_BITS)
-#define CAPTURE_BUF_SIZE_WORDS  (CAPTURE_BUF_SIZE_BYTES / sizeof(uint32_t))
-
 // --- PSRAM trace ring buffer ---
 // 8 MB PSRAM / 8 bytes per record = 1M records, power of 2
 #define PSRAM_RING_RECORDS      (1u << 20)    // 1,048,576 records
