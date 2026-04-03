@@ -145,6 +145,7 @@ typedef struct {
     uint32_t max_dma_distance; // worst DMA backlog (samples)
     uint32_t max_stage_depth;  // worst staging buffer depth (records)
     uint32_t total_samples;    // total PIO samples processed
+    uint32_t cpu_clock_khz;    // actual CPU clock in kHz
 } status_response_t;
 
 #endif // Z80_TRACE_H

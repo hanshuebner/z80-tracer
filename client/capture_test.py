@@ -18,7 +18,7 @@ import serial
 from . import capture
 
 
-def run_diag_mode(ser, mode, name, duration):
+def run_diag_mode(ser, mode, name, duration, cpu_mhz):
     """Run one diagnostic mode and report results."""
     capture.set_diag_mode(ser, mode)
     capture.start_capture(ser)
@@ -29,10 +29,10 @@ def run_diag_mode(ser, mode, name, duration):
 
     samples_sec = status['total_samples'] / duration
     records_sec = status['write_idx'] / duration if status['write_idx'] else 0
-    cycles_per_sample = 250e6 / samples_sec if samples_sec > 0 else float('inf')
+    cycles_per_sample = (cpu_mhz * 1e6) / samples_sec if samples_sec > 0 else float('inf')
 
     print(f"\n  [{name}]")
-    print(f"    samples/sec:      {samples_sec:,.0f}  ({cycles_per_sample:.1f} cycles/sample at 250MHz)")
+    print(f"    samples/sec:      {samples_sec:,.0f}  ({cycles_per_sample:.1f} cycles/sample at {cpu_mhz}MHz)")
     print(f"    records/sec:      {records_sec:,.0f}")
     print(f"    dma_overflows:    {status['dma_overflows']}")
     print(f"    max_dma_distance: {status['max_dma_distance']}/{8192} "
@@ -46,24 +46,30 @@ def run_diag_mode(ser, mode, name, duration):
 
 def run_diagnostics(ser, duration):
     """Run all diagnostic modes to isolate the bottleneck."""
+    # Get CPU clock from firmware
+    status = capture.get_status(ser)
+    cpu_mhz = status['cpu_clock_khz'] / 1000
+    budget = cpu_mhz * 1e6 / 8e6
+
     print(f"=== Performance Diagnostics ({duration}s each) ===")
-    print(f"    Expected: 8M samples/sec at 4MHz Z80 → 31.25 cycles/sample budget")
+    print(f"    CPU clock: {cpu_mhz:.0f} MHz")
+    print(f"    Expected: 8M samples/sec at 4MHz Z80 → {budget:.1f} cycles/sample budget")
 
     # Mode 3: skip everything — pure DMA read loop baseline
     run_diag_mode(ser, capture.DIAG_SKIP_BOTH,
-                  "Mode 3: Skip all (DMA read baseline)", duration)
+                  "Mode 3: Skip all (DMA read baseline)", duration, cpu_mhz)
 
     # Mode 1: skip analyzer, count samples — DMA read loop cost
     run_diag_mode(ser, capture.DIAG_SKIP_ANALYZER,
-                  "Mode 1: Skip analyzer (DMA loop only)", duration)
+                  "Mode 1: Skip analyzer (DMA loop only)", duration, cpu_mhz)
 
     # Mode 2: run analyzer, no PSRAM — isolate state machine cost
     run_diag_mode(ser, capture.DIAG_SKIP_PSRAM,
-                  "Mode 2: Analyzer only (no PSRAM)", duration)
+                  "Mode 2: Analyzer only (no PSRAM)", duration, cpu_mhz)
 
     # Mode 0: full pipeline
     run_diag_mode(ser, 0,
-                  "Mode 0: Full pipeline (analyzer + PSRAM)", duration)
+                  "Mode 0: Full pipeline (analyzer + PSRAM)", duration, cpu_mhz)
 
     # Restore normal mode
     capture.set_diag_mode(ser, 0)

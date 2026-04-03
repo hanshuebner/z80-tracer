@@ -74,9 +74,10 @@ def read_exact(ser, n, timeout=10.0):
 def get_status(ser):
     """Query firmware status. Returns dict with capture state and diagnostics."""
     send_cmd(ser, CMD_GET_STATUS)
-    raw = read_exact(ser, 28)
+    raw = read_exact(ser, 32)
     (magic, capture_active, write_idx, dma_overflows,
-     max_dma_distance, max_stage_depth, total_samples) = struct.unpack('<IIIIIII', raw)
+     max_dma_distance, max_stage_depth, total_samples,
+     cpu_clock_khz) = struct.unpack('<IIIIIIII', raw)
     if magic != STATUS_MAGIC:
         raise ValueError(f"Bad status magic: 0x{magic:08X} (expected 0x{STATUS_MAGIC:08X})")
     return {
@@ -86,6 +87,7 @@ def get_status(ser):
         'max_dma_distance': max_dma_distance,
         'max_stage_depth': max_stage_depth,
         'total_samples': total_samples,
+        'cpu_clock_khz': cpu_clock_khz,
     }
 
 
