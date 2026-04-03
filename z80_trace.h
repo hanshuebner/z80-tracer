@@ -2,6 +2,7 @@
 #define Z80_TRACE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // --- GPIO Pin Assignment (PGA2350) ---
 // GPIO 0-15:  Z80 A0-A15  (address bus)
@@ -11,16 +12,16 @@
 // GPIO 26:    /IORQ        (IO request)
 // GPIO 27:    /RD          (read strobe)
 // GPIO 28:    /WR          (write strobe)
-// GPIO 29:    /RFSH        (refresh - used to filter DRAM refresh cycles)
+// GPIO 29:    /RFSH        (refresh)
 // GPIO 30:    CLK          (Z80 clock)
-// GPIO 31:    /HALT        (halt status, directly monitored)
-// GPIO 32:    /WAIT        (active low OUTPUT - directly driven to throttle Z80)
-// GPIO 33:    /INT         (interrupt request, directly monitored)
-// GPIO 34:    /NMI         (non-maskable interrupt, directly monitored)
-// GPIO 35:    /RESET       (reset, directly monitored)
+// GPIO 31:    /HALT        (halt status)
+// GPIO 32:    /WAIT        (active low - directly driven for flow control, also observed)
+// GPIO 33:    /INT         (interrupt request)
+// GPIO 34:    /NMI         (non-maskable interrupt)
+// GPIO 35:    /RESET       (reset)
 
-#define PIN_ADDR_BASE   0   // A0 = GPIO 0, A15 = GPIO 15
-#define PIN_DATA_BASE   16  // D0 = GPIO 16, D7 = GPIO 23
+#define PIN_ADDR_BASE   0
+#define PIN_DATA_BASE   16
 #define PIN_M1          24
 #define PIN_MREQ        25
 #define PIN_IORQ        26
@@ -29,13 +30,13 @@
 #define PIN_RFSH        29
 #define PIN_CLK         30
 #define PIN_HALT        31
-#define PIN_WAIT        32  // output
+#define PIN_WAIT        32  // output (flow control) + input (observe)
 #define PIN_INT         33
 #define PIN_NMI         34
 #define PIN_RESET       35
 
 #define PIN_IN_BASE     0   // PIO in_base: GPIO 0
-#define PIN_IN_COUNT    31  // capture GPIO 0-30 (31 pins)
+#define PIN_IN_COUNT    32  // capture GPIO 0-31 (32 pins)
 
 // --- Captured bus sample format (32-bit word from PIO) ---
 // Bits 0-15:  address (A0-A15)
@@ -46,7 +47,8 @@
 // Bit  27:    /RD
 // Bit  28:    /WR
 // Bit  29:    /RFSH
-// Bit  30:    CLK
+// Bit  30:    CLK  (1 = sample taken at rising edge, 0 = falling edge)
+// Bit  31:    /HALT
 
 #define SAMPLE_ADDR_MASK    0x0000FFFF
 #define SAMPLE_DATA_SHIFT   16
@@ -58,34 +60,35 @@
 #define SAMPLE_WR_BIT       (1u << 28)
 #define SAMPLE_RFSH_BIT     (1u << 29)
 #define SAMPLE_CLK_BIT      (1u << 30)
+#define SAMPLE_HALT_BIT     (1u << 31)
 
-// Cycle type classification (derived from control signals, active-low inverted)
+// Cycle type classification (produced by analyzer state machine)
 typedef enum {
-    CYCLE_OPCODE_FETCH,   // /M1=0, /MREQ=0, /RD=0
-    CYCLE_MEM_READ,       // /M1=1, /MREQ=0, /RD=0
-    CYCLE_MEM_WRITE,      // /M1=1, /MREQ=0, /WR=0
-    CYCLE_IO_READ,        // /IORQ=0, /RD=0
-    CYCLE_IO_WRITE,       // /IORQ=0, /WR=0
-    CYCLE_INT_ACK,        // /M1=0, /IORQ=0, /RD=0 (maskable interrupt acknowledge)
-    CYCLE_UNKNOWN
+    CYCLE_M1_FETCH   = 0,   // M1 opcode fetch
+    CYCLE_MEM_READ   = 1,   // Memory read
+    CYCLE_MEM_WRITE  = 2,   // Memory write
+    CYCLE_IO_READ    = 3,   // I/O read
+    CYCLE_IO_WRITE   = 4,   // I/O write
+    CYCLE_INT_ACK    = 5,   // Interrupt acknowledge
+    CYCLE_RESET      = 6,   // Reset (emitted when /RESET releases)
 } cycle_type_t;
 
-static inline cycle_type_t classify_sample(uint32_t sample) {
-    // Control signals are active-low: bit=0 means active
-    int m1   = !(sample & SAMPLE_M1_BIT);
-    int mreq = !(sample & SAMPLE_MREQ_BIT);
-    int iorq = !(sample & SAMPLE_IORQ_BIT);
-    int rd   = !(sample & SAMPLE_RD_BIT);
-    int wr   = !(sample & SAMPLE_WR_BIT);
+// Trace record produced by analyzer state machine (core 1 → core 0)
+typedef struct {
+    uint16_t address;       // A[15:0] captured at T1 rising edge
+    uint8_t  data;          // D[7:0] captured at cycle-specific edge
+    uint8_t  cycle_type;    // cycle_type_t
+    uint8_t  refresh;       // A[6:0] refresh address (M1_FETCH only)
+    uint8_t  wait_count;    // number of wait states (includes auto-waits for I/O)
+    uint8_t  flags;         // TRACE_FLAG_*
+    uint8_t  _pad;
+} trace_record_t;
 
-    if (m1 && mreq && rd)  return CYCLE_OPCODE_FETCH;
-    if (m1 && iorq && rd)  return CYCLE_INT_ACK;   // INT acknowledge: M1+IORQ, no MREQ
-    if (mreq && rd)        return CYCLE_MEM_READ;
-    if (mreq && wr)        return CYCLE_MEM_WRITE;
-    if (iorq && rd)        return CYCLE_IO_READ;
-    if (iorq && wr)        return CYCLE_IO_WRITE;
-    return CYCLE_UNKNOWN;
-}
+#define TRACE_FLAG_HALT  (1u << 0)  // CPU is halted
+#define TRACE_FLAG_INT   (1u << 1)  // /INT was active at end of cycle
+#define TRACE_FLAG_NMI   (1u << 2)  // /NMI falling edge detected
+
+// --- Helpers ---
 
 static inline uint16_t sample_addr(uint32_t sample) {
     return sample & SAMPLE_ADDR_MASK;
@@ -97,22 +100,23 @@ static inline uint8_t sample_data(uint32_t sample) {
 
 // --- Ring buffer for DMA capture ---
 // Must be power-of-2 sized and aligned for DMA ring mode.
-// DMA RING_SIZE field is 4 bits, max 15 -> max ring is 2^15 = 32KB.
-// Configure via CAPTURE_BUF_RING_BITS (log2 of buffer size in bytes).
 #define CAPTURE_BUF_RING_BITS   15            // log2(32KB) = 15 — max DMA ring size
 #define CAPTURE_BUF_SIZE_BYTES  (1u << CAPTURE_BUF_RING_BITS)
 #define CAPTURE_BUF_SIZE_WORDS  (CAPTURE_BUF_SIZE_BYTES / sizeof(uint32_t))
 
-// USB CDC output packet format (binary, 4 bytes with bit-7 sync):
+// USB CDC output packet format (binary, 6 bytes with bit-7 sync):
 //   Byte 0:  1TTTT_AAA   bit7=1 (sync), bits 6-3 = cycle_type, bits 2-0 = addr[15:13]
-//   Byte 1:  0AAA_AAAA   bit7=0, bits 6-0 = addr[12:6]
-//   Byte 2:  0AAA_AAAD   bit7=0, bits 6-1 = addr[5:0], bit 0 = data[7]
-//   Byte 3:  0DDD_DDDD   bit7=0, bits 6-0 = data[6:0]
-// Only byte 0 has bit 7 set — scan for it to resync after connecting mid-stream.
-#define USB_PACKET_SIZE 4
+//   Byte 1:  0AAA_AAAA   bits 6-0 = addr[12:6]
+//   Byte 2:  0AAA_AAAD   bits 6-1 = addr[5:0], bit 0 = data[7]
+//   Byte 3:  0DDD_DDDD   bits 6-0 = data[6:0]
+//   Byte 4:  0RRR_RRRR   bits 6-0 = refresh[6:0]
+//   Byte 5:  0HWW_WWWW   bit 6 = halt, bits 5-0 = wait_count[5:0]
+// Only byte 0 has bit 7 set — scan for it to resync mid-stream.
+#define USB_PACKET_SIZE 6
 
-// Flow control thresholds (in ring buffer entries)
-#define FLOW_CTRL_ASSERT_THRESHOLD   (CAPTURE_BUF_SIZE_WORDS * 3 / 4)
-#define FLOW_CTRL_RELEASE_THRESHOLD  (CAPTURE_BUF_SIZE_WORDS / 4)
+// Flow control thresholds (trace record queue entries)
+#define TRACE_QUEUE_SIZE            256
+#define FLOW_CTRL_ASSERT_THRESHOLD  (TRACE_QUEUE_SIZE * 3 / 4)
+#define FLOW_CTRL_RELEASE_THRESHOLD (TRACE_QUEUE_SIZE / 4)
 
 #endif // Z80_TRACE_H

@@ -23,29 +23,40 @@ from .z80_loop import LoopDetector
 from .trace_filter import TraceFilter, FilterConfig, parse_address_range, parse_trigger_addr
 
 
-# -- Wire protocol (matches firmware) --
+# -- Wire protocol (matches firmware z80_trace.h) --
 
-CYCLE_OPCODE_FETCH = 0
+CYCLE_OPCODE_FETCH = 0  # M1 opcode fetch (CYCLE_M1_FETCH in firmware)
 CYCLE_MEM_READ = 1
 CYCLE_MEM_WRITE = 2
 CYCLE_IO_READ = 3
 CYCLE_IO_WRITE = 4
 CYCLE_INT_ACK = 5
+CYCLE_RESET = 6
 
-CYCLE_NAMES = ("FETCH", "MREAD", "MWRIT", "IOREAD", "IOWRIT", "INTACK")
-PACKET_SIZE = 4
+CYCLE_NAMES = ("FETCH", "MREAD", "MWRIT", "IOREAD", "IOWRIT", "INTACK", "RESET")
+PACKET_SIZE = 6
 
 
 def parse_packet(data):
-    """Parse a 4-byte trace packet with bit-7 sync framing.
+    """Parse a 6-byte trace packet with bit-7 sync framing.
 
-    Format: 1TTTT_AAA 0AAAAAAA 0AAAAAAD 0DDDDDDD
-    Returns (cycle_type, addr, value).
+    Format:
+      Byte 0: 1TTTT_AAA  sync=1, type[3:0], addr[15:13]
+      Byte 1: 0AAAAAAA   addr[12:6]
+      Byte 2: 0AAAAAAD   addr[5:0], data[7]
+      Byte 3: 0DDDDDDD   data[6:0]
+      Byte 4: 0RRRRRRR   refresh[6:0]
+      Byte 5: 0HWWWWWW   halt, wait_count[5:0]
+
+    Returns (cycle_type, addr, value, refresh, wait_count, halt).
     """
     cycle_type = (data[0] >> 3) & 0x0F
     addr = ((data[0] & 0x07) << 13) | (data[1] << 6) | (data[2] >> 1)
     value = ((data[2] & 0x01) << 7) | data[3]
-    return cycle_type, addr, value
+    refresh = data[4] & 0x7F
+    halt = bool(data[5] & 0x40)
+    wait_count = data[5] & 0x3F
+    return cycle_type, addr, value, refresh, wait_count, halt
 
 
 # -- Instruction assembler --
@@ -331,11 +342,22 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                 pkt = buf[:PACKET_SIZE]
                 buf = buf[PACKET_SIZE:]
 
-                cycle_type, addr, value = parse_packet(pkt)
+                cycle_type, addr, value, refresh, wait_count, halt = parse_packet(pkt)
 
                 if raw_output:
                     ct_name = CYCLE_NAMES[cycle_type] if cycle_type < len(CYCLE_NAMES) else "?"
-                    print(f"  {ct_name:6s} {addr:04X} {value:02X}")
+                    extras = ""
+                    if cycle_type == CYCLE_OPCODE_FETCH:
+                        extras = f" R={refresh:02X}"
+                    if wait_count:
+                        extras += f" W={wait_count}"
+                    if halt:
+                        extras += " HALT"
+                    print(f"  {ct_name:6s} {addr:04X} {value:02X}{extras}")
+
+                if cycle_type == CYCLE_RESET:
+                    print(f"; --- RESET ---")
+                    continue
 
                 instr = assembler.feed(cycle_type, addr, value)
 

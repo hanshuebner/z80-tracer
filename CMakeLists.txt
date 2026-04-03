@@ -20,6 +20,8 @@ target_include_directories(z80_tracer PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
 target_link_libraries(z80_tracer
     pico_stdlib
+    pico_multicore
+    pico_util
     hardware_pio
     hardware_dma
     hardware_gpio

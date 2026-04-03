@@ -1,14 +1,13 @@
-; Z80 Bus Tracer - PIO program for PGA2350
+; Z80 Bus Analyzer - PIO program for PGA2350
 ;
-; Single state machine: samples all bus signals at each Z80 CLK
-; falling edge. All cycle classification and filtering is done
-; in software on the ARM core.
+; Samples all bus signals at BOTH Z80 CLK edges (rising and falling).
+; The ARM core runs the full cycle-level state machine.
 ;
 ; Pin mapping (configured via C SDK):
-;   in_base = GPIO 0 (captures GPIO 0-30: addr + data + control)
+;   in_base = GPIO 0 (captures GPIO 0-31: addr + data + control + halt)
 ;   CLK     = GPIO 30
 ;
-; Captured 31-bit word layout:
+; Captured 32-bit word layout:
 ;   [15:0]  = A0-A15
 ;   [23:16] = D0-D7
 ;   [24]    = /M1
@@ -17,13 +16,17 @@
 ;   [27]    = /RD
 ;   [28]    = /WR
 ;   [29]    = /RFSH
-;   [30]    = CLK
+;   [30]    = CLK  (1 = rising edge sample, 0 = falling edge sample)
+;   [31]    = /HALT
+;
+; Autopush at 32 bits — no manual push needed.
+; Two samples per Z80 clock period.
 
 .program z80_bus_sample
 
 .wrap_target
-    wait 1 gpio 30          ; wait for CLK high
-    wait 0 gpio 30          ; CLK falling edge — all signals stable
-    in pins, 31             ; capture GPIO 0-30
-    push noblock            ; push to RX FIFO (drop if full)
+    wait 1 gpio 30          ; wait for CLK rising edge
+    in pins, 32             ; capture GPIO 0-31 (CLK=1 → rising edge)
+    wait 0 gpio 30          ; wait for CLK falling edge
+    in pins, 32             ; capture GPIO 0-31 (CLK=0 → falling edge)
 .wrap
