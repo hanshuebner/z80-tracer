@@ -500,7 +500,8 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                     elif subtype == STATUS_DMA_OVERFLOW:
                         diag_dma_overflows += count
                     elif subtype == STATUS_FLOW_DISCARD:
-                        diag_flow_discards += count
+                        # 28-bit value: seq=high14, count=low14
+                        diag_flow_discards += (seq << 14) | count
                     elif subtype == STATUS_FRAMES_SENT:
                         # 28-bit value: seq=high14, count=low14
                         diag_fw_frames_sent = (seq << 14) | count
@@ -661,9 +662,11 @@ def run_trace(source: BinaryIO, raw_output=False, is_file=False,
                                     elif val == STATUS_DMA_OVERFLOW:
                                         diag_dma_overflows += wc
                                     elif val == STATUS_FLOW_DISCARD:
-                                        diag_flow_discards += wc
+                                        # 28-bit: seq=high14, count=low14
+                                        _, sq, _, _, ct2, _ = parse_packet(pkt)
+                                        diag_flow_discards += (sq << 14) | ct2
                                     elif val == STATUS_FRAMES_SENT:
-                                        # Re-parse: need seq (addr) field
+                                        # 28-bit: seq=high14, count=low14
                                         _, sq, _, _, ct2, _ = parse_packet(pkt)
                                         diag_fw_frames_sent = (sq << 14) | ct2
             except (KeyboardInterrupt, StopIteration):

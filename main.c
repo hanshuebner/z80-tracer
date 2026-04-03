@@ -950,8 +950,7 @@ int main(void) {
                         send_status(STATUS_DMA_OVERFLOW, ov);
                     }
                     if (diag_flow_discards > 0) {
-                        uint16_t fd = diag_flow_discards > 0x3FFF ? 0x3FFF : diag_flow_discards;
-                        send_status(STATUS_FLOW_DISCARD, fd);
+                        send_status_wide(STATUS_FLOW_DISCARD, diag_flow_discards);
                     }
                     // Always send total frames so client can detect USB loss
                     send_status_wide(STATUS_FRAMES_SENT, usb_frames_sent);
