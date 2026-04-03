@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Z80 Bus Analyzer — State Machine Description</title>
+<style>
+:root {
+  --bg: #faf9f6; --bg2: #f1efe8; --fg: #1a1a18; --fg2: #5f5e5a; --fg3: #88878080;
+  --border: rgba(0,0,0,0.15); --font: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: "SF Mono", "Fira Code", "Consolas", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #1a1a18; --bg2: #2c2c2a; --fg: #e8e6df; --fg2: #b4b2a9; --fg3: #5f5e5a80; --border: rgba(255,255,255,0.15); }
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: var(--font); font-size: 15px; line-height: 1.7; color: var(--fg); background: var(--bg); max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+h1 { font-size: 22px; font-weight: 500; margin: 0 0 0.25rem; }
+h2 { font-size: 18px; font-weight: 500; margin: 2.5rem 0 1rem; padding-top: 1.5rem; border-top: 1px solid var(--border); }
+h3 { font-size: 16px; font-weight: 500; margin: 2rem 0 0.75rem; }
+p { margin: 0 0 1rem; }
+hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+code { font-family: var(--mono); font-size: 13px; background: var(--bg2); padding: 0.15em 0.4em; border-radius: 3px; }
+pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background: var(--bg2); padding: 1rem 1.25rem; border-radius: 6px; overflow-x: auto; margin: 1rem 0; white-space: pre; }
+table { border-collapse: collapse; margin: 1rem 0; font-size: 14px; width: 100%; }
+th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+th { background: var(--bg2); font-weight: 500; }
+strong { font-weight: 500; }
+.subtitle { color: var(--fg2); font-size: 14px; margin-bottom: 2rem; }
+.diagram-container { margin: 1.5rem 0; padding: 1rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+.diagram-container svg { display: block; width: 100%; height: auto; }
+.note { background: var(--bg2); border-left: 3px solid var(--fg2); padding: 0.75rem 1rem; margin: 1rem 0; border-radius: 0 4px 4px 0; font-size: 14px; }
+
+/* SVG text classes */
+svg .t { font-family: var(--font); font-size: 14px; fill: var(--fg); font-weight: 400; }
+svg .ts { font-family: var(--font); font-size: 12px; fill: var(--fg2); font-weight: 400; }
+svg .th { font-family: var(--font); font-size: 14px; fill: var(--fg); font-weight: 500; }
+svg .arr { stroke: var(--fg2); stroke-width: 1.5; }
+svg .leader { stroke: var(--fg3); stroke-width: 0.5; fill: none; }
+svg .box > rect { fill: var(--bg2); stroke: var(--border); }
+
+/* Colored node classes — light mode */
+svg .c-purple > rect, svg .c-purple > circle, svg .c-purple > ellipse { fill: #EEEDFE; stroke: #534AB7; }
+svg .c-purple .th { fill: #3C3489; } svg .c-purple .ts { fill: #534AB7; }
+svg .c-teal > rect { fill: #E1F5EE; stroke: #0F6E56; }
+svg .c-teal .th { fill: #085041; } svg .c-teal .ts { fill: #0F6E56; }
+svg .c-coral > rect { fill: #FAECE7; stroke: #993C1D; }
+svg .c-coral .th { fill: #712B13; } svg .c-coral .ts { fill: #993C1D; }
+svg .c-amber > rect { fill: #FAEEDA; stroke: #854F0B; }
+svg .c-amber .th { fill: #633806; } svg .c-amber .ts { fill: #854F0B; }
+svg .c-gray > rect { fill: #F1EFE8; stroke: #5F5E5A; }
+svg .c-gray .th { fill: #444441; } svg .c-gray .ts { fill: #5F5E5A; }
+svg .c-blue > rect { fill: #E6F1FB; stroke: #185FA5; }
+svg .c-blue .th { fill: #0C447C; } svg .c-blue .ts { fill: #185FA5; }
+
+@media (prefers-color-scheme: dark) {
+  svg .c-purple > rect, svg .c-purple > circle, svg .c-purple > ellipse { fill: #26215C; stroke: #AFA9EC; }
+  svg .c-purple .th { fill: #CECBF6; } svg .c-purple .ts { fill: #AFA9EC; }
+  svg .c-teal > rect { fill: #04342C; stroke: #5DCAA5; }
+  svg .c-teal .th { fill: #9FE1CB; } svg .c-teal .ts { fill: #5DCAA5; }
+  svg .c-coral > rect { fill: #4A1B0C; stroke: #F0997B; }
+  svg .c-coral .th { fill: #F5C4B3; } svg .c-coral .ts { fill: #F0997B; }
+  svg .c-amber > rect { fill: #412402; stroke: #EF9F27; }
+  svg .c-amber .th { fill: #FAC775; } svg .c-amber .ts { fill: #EF9F27; }
+  svg .c-gray > rect { fill: #2C2C2A; stroke: #B4B2A9; }
+  svg .c-gray .th { fill: #D3D1C7; } svg .c-gray .ts { fill: #B4B2A9; }
+  svg .c-blue > rect { fill: #042C53; stroke: #85B7EB; }
+  svg .c-blue .th { fill: #B5D4F4; } svg .c-blue .ts { fill: #85B7EB; }
+}
+</style>
+</head>
+<body>
+
+<h1>Z80 Bus Analyzer — State Machine Description</h1>
+<p class="subtitle">Reference: Zilog Z80 CPU User Manual UM008011-0816, pp. 7–17</p>
+
+<h2>1. Monitored Signals</h2>
+
+<table>
+<tr><th>Signal</th><th>Dir</th><th>Active</th><th>Sampling Notes</th></tr>
+<tr><td><code>CLK</code></td><td>in</td><td>—</td><td>All state transitions keyed to CLK edges</td></tr>
+<tr><td><code>A15–A0</code></td><td>out</td><td>High</td><td>Active during T1; refresh addr during M1 T3–T4</td></tr>
+<tr><td><code>D7–D0</code></td><td>bi</td><td>High</td><td>Sampled at specific points per cycle type</td></tr>
+<tr><td><code>/M1</code></td><td>out</td><td>Low</td><td>Identifies opcode fetch or interrupt ack</td></tr>
+<tr><td><code>/MREQ</code></td><td>out</td><td>Low</td><td>Memory access (fetch, read, write, refresh)</td></tr>
+<tr><td><code>/IORQ</code></td><td>out</td><td>Low</td><td>I/O access or interrupt acknowledge</td></tr>
+<tr><td><code>/RD</code></td><td>out</td><td>Low</td><td>CPU wants to read</td></tr>
+<tr><td><code>/WR</code></td><td>out</td><td>Low</td><td>CPU data bus holds valid write data</td></tr>
+<tr><td><code>/RFSH</code></td><td>out</td><td>Low</td><td>Refresh address on low 7 bits of addr bus</td></tr>
+<tr><td><code>/HALT</code></td><td>out</td><td>Low</td><td>CPU is in HALT state (executing NOPs)</td></tr>
+<tr><td><code>/WAIT</code></td><td>in</td><td>Low</td><td>Peripheral requests wait states</td></tr>
+<tr><td><code>/BUSREQ</code></td><td>in</td><td>Low</td><td>External device requests bus</td></tr>
+<tr><td><code>/BUSACK</code></td><td>out</td><td>Low</td><td>CPU has released bus</td></tr>
+<tr><td><code>/INT</code></td><td>in</td><td>Low</td><td>Maskable interrupt request</td></tr>
+<tr><td><code>/NMI</code></td><td>in</td><td>Low</td><td>Nonmaskable interrupt (edge-triggered)</td></tr>
+<tr><td><code>/RESET</code></td><td>in</td><td>Low</td><td>System reset</td></tr>
+</table>
+
+<h2>2. State Machine Overview</h2>
+
+<p>The analyzer tracks two levels of state: <strong>cycle type</strong> (which kind of machine cycle is in progress) and <strong>T-state</strong> (which clock period within that cycle).</p>
+
+<p>Every transition is triggered by a CLK edge (rising ↑ or falling ↓). Signal levels are sampled at the indicated edge to determine the next state.</p>
+
+<h2>3. Cycle Type Identification</h2>
+
+<p>At the start of T1 (rising edge of CLK entering T1), the analyzer must determine what cycle type is beginning. The discrimination depends partly on what happens <em>during</em> the cycle (e.g., /MREQ vs /IORQ going low), so the analyzer uses a two-phase identification:</p>
+
+<h3>Phase 1 — T1 rising edge: Check /M1</h3>
+
+<table>
+<tr><th>/M1 at T1↑</th><th>Meaning</th></tr>
+<tr><td>Low</td><td>This is an M1 cycle (opcode fetch or INT ack)</td></tr>
+<tr><td>High</td><td>Non-M1 cycle (mem r/w, I/O r/w)</td></tr>
+</table>
+
+<h3>Phase 2 — T1 falling edge: Refine cycle type</h3>
+
+<p>For <strong>M1 cycles</strong> (/M1 low):</p>
+
+<table>
+<tr><th>/MREQ at T1↓</th><th>/IORQ</th><th>Cycle Type</th><th>Ref</th></tr>
+<tr><td>Low</td><td>High</td><td><strong>OPCODE FETCH</strong></td><td>Fig. 5</td></tr>
+<tr><td>High</td><td>(later)</td><td><strong>INTERRUPT ACKNOWLEDGE</strong></td><td>Fig. 9</td></tr>
+</table>
+
+<p>For <strong>non-M1 cycles</strong> (/M1 high), determined at T1↓ / T2↑:</p>
+
+<table>
+<tr><th>/MREQ</th><th>/IORQ</th><th>/RD</th><th>/WR</th><th>Cycle Type</th><th>Ref</th></tr>
+<tr><td>Low</td><td>High</td><td>Low</td><td>High</td><td><strong>MEMORY READ</strong></td><td>Fig. 6</td></tr>
+<tr><td>Low</td><td>High</td><td>High</td><td>Low</td><td><strong>MEMORY WRITE</strong></td><td>Fig. 6</td></tr>
+<tr><td>High</td><td>Low</td><td>Low</td><td>High</td><td><strong>I/O READ</strong></td><td>Fig. 7</td></tr>
+<tr><td>High</td><td>Low</td><td>High</td><td>Low</td><td><strong>I/O WRITE</strong></td><td>Fig. 7</td></tr>
+</table>
+
+<div class="note">I/O: /IORQ and /RD or /WR go active at T2↑ (not T1↓ like memory). The analyzer sees /MREQ staying high through T1↓ to distinguish I/O from memory.</div>
+
+<h3>Special states (detected by dedicated signals)</h3>
+
+<table>
+<tr><th>Condition</th><th>State</th><th>Ref</th></tr>
+<tr><td>/BUSACK low</td><td><strong>BUS RELEASED</strong></td><td>Fig. 8</td></tr>
+<tr><td>/HALT low + M1 cycling</td><td><strong>HALT</strong> (NOP fetch)</td><td>Fig. 11</td></tr>
+<tr><td>/RESET low</td><td><strong>RESET</strong></td><td>p. 6</td></tr>
+</table>
+
+<h3>Cycle type discrimination — state diagram</h3>
+
+<div class="diagram-container">
+<svg width="100%" viewBox="0 0 680 530" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="a1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-gray"><rect x="250" y="20" width="180" height="44" rx="8" stroke-width="0.5"/><text class="th" x="340" y="42" text-anchor="middle" dominant-baseline="central">CLK ↑ entering T1</text></g>
+<line x1="340" y1="64" x2="340" y2="84" class="arr" marker-end="url(#a1)"/>
+<g class="c-coral"><rect x="255" y="84" width="170" height="44" rx="8" stroke-width="0.5"/><text class="th" x="340" y="106" text-anchor="middle" dominant-baseline="central">/RESET low?</text></g>
+<line x1="425" y1="106" x2="498" y2="106" class="arr" marker-end="url(#a1)"/><text class="ts" x="460" y="98">yes</text>
+<g class="c-coral"><rect x="500" y="84" width="100" height="44" rx="8" stroke-width="0.5"/><text class="th" x="550" y="106" text-anchor="middle" dominant-baseline="central">RESET</text></g>
+<line x1="340" y1="128" x2="340" y2="152" class="arr" marker-end="url(#a1)"/><text class="ts" x="352" y="144">no</text>
+<g class="c-coral"><rect x="245" y="152" width="190" height="44" rx="8" stroke-width="0.5"/><text class="th" x="340" y="174" text-anchor="middle" dominant-baseline="central">/BUSACK low?</text></g>
+<line x1="435" y1="174" x2="498" y2="174" class="arr" marker-end="url(#a1)"/><text class="ts" x="460" y="166">yes</text>
+<g class="c-coral"><rect x="500" y="152" width="130" height="44" rx="8" stroke-width="0.5"/><text class="th" x="565" y="174" text-anchor="middle" dominant-baseline="central">BUS released</text></g>
+<line x1="340" y1="196" x2="340" y2="222" class="arr" marker-end="url(#a1)"/><text class="ts" x="352" y="213">no</text>
+<g class="c-purple"><rect x="240" y="222" width="200" height="44" rx="8" stroke-width="0.5"/><text class="th" x="340" y="244" text-anchor="middle" dominant-baseline="central">/M1 low at T1 ↑ ?</text></g>
+<path d="M280 266 L280 290 L170 290 L170 310" fill="none" class="arr" marker-end="url(#a1)"/><text class="ts" x="210" y="284">yes</text>
+<path d="M400 266 L400 290 L500 290 L500 310" fill="none" class="arr" marker-end="url(#a1)"/><text class="ts" x="434" y="284">no</text>
+<g class="c-purple"><rect x="62" y="310" width="216" height="44" rx="8" stroke-width="0.5"/><text class="th" x="170" y="332" text-anchor="middle" dominant-baseline="central">/MREQ low at T1 ↓ ?</text></g>
+<g class="c-purple"><rect x="385" y="310" width="230" height="44" rx="8" stroke-width="0.5"/><text class="th" x="500" y="332" text-anchor="middle" dominant-baseline="central">/MREQ low at T1 ↓ ?</text></g>
+<path d="M115 354 L115 370 L100 370 L100 390" fill="none" class="arr" marker-end="url(#a1)"/><text class="ts" x="82" y="368">yes</text>
+<path d="M225 354 L225 370 L256 370 L256 390" fill="none" class="arr" marker-end="url(#a1)"/><text class="ts" x="235" y="368">no</text>
+<g class="c-teal"><rect x="30" y="390" width="140" height="56" rx="8" stroke-width="0.5"/><text class="th" x="100" y="408" text-anchor="middle" dominant-baseline="central">OPCODE FETCH</text><text class="ts" x="100" y="428" text-anchor="middle" dominant-baseline="central">data at T3 ↑</text></g>
+<g class="c-teal"><rect x="190" y="390" width="130" height="56" rx="8" stroke-width="0.5"/><text class="th" x="255" y="408" text-anchor="middle" dominant-baseline="central">INT ACK</text><text class="ts" x="255" y="428" text-anchor="middle" dominant-baseline="central">data at T3 ↓</text></g>
+<path d="M450 354 L450 370 L430 370 L430 390" fill="none" class="arr" marker-end="url(#a1)"/><text class="ts" x="418" y="368">yes</text>
+<path d="M555 354 L555 370 L570 370 L570 390" fill="none" class="arr" marker-end="url(#a1)"/><text class="ts" x="575" y="368">no</text>
+<g class="c-blue"><rect x="360" y="390" width="140" height="56" rx="8" stroke-width="0.5"/><text class="th" x="430" y="408" text-anchor="middle" dominant-baseline="central">MEMORY r/w</text><text class="ts" x="430" y="428" text-anchor="middle" dominant-baseline="central">3 T-states + waits</text></g>
+<g class="c-blue"><rect x="510" y="390" width="120" height="56" rx="8" stroke-width="0.5"/><text class="th" x="570" y="408" text-anchor="middle" dominant-baseline="central">I/O r/w</text><text class="ts" x="570" y="428" text-anchor="middle" dominant-baseline="central">4 T-states + waits</text></g>
+<text class="ts" x="430" y="466" text-anchor="middle">/RD ↓ → read, /WR ↓ → write</text>
+<text class="ts" x="570" y="466" text-anchor="middle">/RD or /WR at T2 ↑</text>
+<text class="ts" x="430" y="482" text-anchor="middle">read: data at T3 ↓</text>
+<text class="ts" x="430" y="498" text-anchor="middle">write: data at T2 ↑</text>
+<text class="ts" x="570" y="482" text-anchor="middle">read: data at T3 ↓</text>
+<text class="ts" x="570" y="498" text-anchor="middle">write: data at T2 ↑</text>
+<text class="ts" x="100" y="466" text-anchor="middle">4 T-states (+ refresh)</text>
+<text class="ts" x="255" y="466" text-anchor="middle">2 auto waits + refresh</text>
+</svg>
+</div>
+
+<h2>4. Cycle State Machines</h2>
+
+<p>Each cycle type below is a sub-state-machine. Transitions are annotated with the CLK edge that triggers them. Capture actions are marked with ►.</p>
+
+<h3>4.1 OPCODE FETCH (M1 cycle) — Ref: Figure 5</h3>
+
+<pre>Entry: /M1 goes low (observed at T1 rising edge)
+
+         ┌──────────────────────────────────────────────────┐
+         │                  M1 Cycle                        │
+         │                                                  │
+  T1 ↑   │  /M1=low, Address bus = PC                      │
+         │  ► CAPTURE address (this is the PC)              │
+         │                                                  │
+  T1 ↓   │  /MREQ ↓, /RD ↓                                │
+         │  (confirms: opcode fetch, not INT ACK)           │
+         │                                                  │
+  T2 ↑   │  (memory responding)                             │
+         │                                                  │
+  T2 ↓   │  ► SAMPLE /WAIT                                 │
+         │  if /WAIT=low → insert TW, stay at T2↓ check    │
+         │  if /WAIT=high → proceed to T3                   │
+         │                                                  │
+  TW ↑   │  (wait state — may repeat)                      │
+  TW ↓   │  ► SAMPLE /WAIT again                           │
+         │  if /WAIT=low → another TW                       │
+         │  if /WAIT=high → proceed to T3                   │
+         │                                                  │
+  T3 ↑   │  ► CAPTURE data bus (this is the OPCODE)        │
+         │  /MREQ ↑, /RD ↑                                 │
+         │  Address bus transitions to refresh address      │
+         │  /RFSH ↓                                         │
+         │                                                  │
+  T3 ↓   │  /MREQ ↓ (for refresh)                         │
+         │  ► CAPTURE refresh address (low 7 bits = R reg)  │
+         │                                                  │
+  T4 ↑   │  /MREQ ↑ (refresh complete)                    │
+         │  /RFSH ↑, /M1 ↑                                 │
+         │  ► SAMPLE /BUSREQ (for possible bus release)     │
+         │  ► SAMPLE /INT, /NMI (at end of last M cycle     │
+         │    of instruction only — tracked by decoder)     │
+         │                                                  │
+  T4 ↓   │  → Next cycle's T1 follows                      │
+         └──────────────────────────────────────────────────┘
+
+Capture record:
+  { type: M1_FETCH, addr: A[15:0]@T1↑, data: D[7:0]@T3↑,
+    refresh: A[6:0]@T3↓, waits: count_of_TW,
+    halt: /HALT level }</pre>
+
+<div class="diagram-container">
+<svg width="100%" viewBox="0 0 680 580" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="a2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="th" x="40" y="16">M1 opcode fetch — ref: fig. 5</text>
+<line class="leader" x1="46" y1="40" x2="46" y2="252" stroke-dasharray="4 3"/>
+<text class="ts" x="40" y="150" text-anchor="middle" transform="rotate(-90 40 150)">opcode read</text>
+<line class="leader" x1="46" y1="290" x2="46" y2="540" stroke-dasharray="4 3"/>
+<text class="ts" x="40" y="420" text-anchor="middle" transform="rotate(-90 40 420)">refresh</text>
+<g class="c-teal"><rect x="70" y="32" width="290" height="56" rx="8" stroke-width="0.5"/><text class="th" x="215" y="50" text-anchor="middle" dominant-baseline="central">T1 ↑  addr bus = PC</text><text class="ts" x="215" y="70" text-anchor="middle" dominant-baseline="central">► capture address, /M1 low</text></g>
+<line x1="215" y1="88" x2="215" y2="104" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="70" y="104" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="126" text-anchor="middle" dominant-baseline="central">T1 ↓  /MREQ ↓  /RD ↓</text></g>
+<line x1="215" y1="148" x2="215" y2="164" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="70" y="164" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="186" text-anchor="middle" dominant-baseline="central">T2 ↑  memory responding</text></g>
+<line x1="215" y1="208" x2="215" y2="224" class="arr" marker-end="url(#a2)"/>
+<g class="c-purple"><rect x="70" y="224" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="246" text-anchor="middle" dominant-baseline="central">T2 ↓  sample /WAIT</text></g>
+<line x1="360" y1="246" x2="418" y2="246" class="arr" marker-end="url(#a2)"/><text class="ts" x="388" y="238">/WAIT low</text>
+<g class="c-amber"><rect x="420" y="224" width="170" height="44" rx="8" stroke-width="0.5"/><text class="th" x="505" y="246" text-anchor="middle" dominant-baseline="central">TW ↓  sample /WAIT</text></g>
+<path d="M590 236 L616 236 L616 216 L505 216 L505 222" fill="none" class="arr" marker-end="url(#a2)"/><text class="ts" x="565" y="212">still low</text>
+<path d="M505 268 L505 278 L217 278" fill="none" stroke="var(--fg2)" stroke-width="0.5" stroke-dasharray="4 3"/>
+<line x1="215" y1="268" x2="215" y2="298" class="arr" marker-end="url(#a2)"/>
+<text class="ts" x="300" y="274">/WAIT high</text>
+<g class="c-teal"><rect x="70" y="298" width="290" height="56" rx="8" stroke-width="0.5"/><text class="th" x="215" y="316" text-anchor="middle" dominant-baseline="central">T3 ↑  ► capture opcode D[7:0]</text><text class="ts" x="215" y="336" text-anchor="middle" dominant-baseline="central">/MREQ ↑  /RD ↑  /RFSH ↓</text></g>
+<line class="leader" x1="362" y1="320" x2="398" y2="320"/><text class="ts" x="404" y="316">data sampled at</text><text class="ts" x="404" y="332">rising edge (T3 ↑)</text>
+<line x1="215" y1="354" x2="215" y2="370" class="arr" marker-end="url(#a2)"/>
+<g class="c-teal"><rect x="70" y="370" width="290" height="56" rx="8" stroke-width="0.5"/><text class="th" x="215" y="388" text-anchor="middle" dominant-baseline="central">T3 ↓  /MREQ ↓ (refresh)</text><text class="ts" x="215" y="408" text-anchor="middle" dominant-baseline="central">► capture refresh addr A[6:0]</text></g>
+<line x1="215" y1="426" x2="215" y2="442" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="70" y="442" width="290" height="56" rx="8" stroke-width="0.5"/><text class="th" x="215" y="460" text-anchor="middle" dominant-baseline="central">T4 ↑  /MREQ ↑  /RFSH ↑  /M1 ↑</text><text class="ts" x="215" y="480" text-anchor="middle" dominant-baseline="central">sample /BUSREQ  /INT  /NMI</text></g>
+<line x1="215" y1="498" x2="215" y2="514" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="70" y="514" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="536" text-anchor="middle" dominant-baseline="central">T4 ↓  → next cycle T1</text></g>
+</svg>
+</div>
+
+<h3>4.2 MEMORY READ — Ref: Figure 6 (left half)</h3>
+
+<pre>Entry: /M1 high, then /MREQ↓ + /RD↓ observed at T1↓
+
+NOTE: Unlike M1 fetch (which samples at T3↑), non-M1 memory read
+samples data at T3↓. The timing diagram confirms data remains
+stable through T3↓ even though /RD rises at T3↑.
+
+Capture record:
+  { type: MEM_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↓,
+    waits: count_of_TW }</pre>
+
+<h3>4.3 MEMORY WRITE — Ref: Figure 6 (right half)</h3>
+
+<pre>Entry: /M1 high, then /MREQ↓ at T1↓, /WR↓ early in T2
+
+Note: /WR goes inactive at T3↑, half a T-state before address
+and data change. This satisfies hold time for memory.
+
+Capture record:
+  { type: MEM_WR, addr: A[15:0]@T1↑, data: D[7:0]@T2↑,
+    waits: count_of_TW }</pre>
+
+<h3>4.4 I/O READ — Ref: Figure 7 (upper half)</h3>
+
+<pre>Entry: /M1 high, /MREQ stays high, /IORQ↓ + /RD↓ at T2↑
+
+IMPORTANT: The cycle is T1-T2-TW*-T3 minimum (4 CLK periods).
+TW* is always inserted. The manual states the reason: the interval
+from /IORQ going active to the WAIT sample point is too short
+for I/O devices to decode their address and assert /WAIT.
+
+Capture record:
+  { type: IO_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↓,
+    waits: 1 + count_of_additional_TW }</pre>
+
+<h3>4.5 I/O WRITE — Ref: Figure 7 (lower half)</h3>
+
+<pre>Capture record:
+  { type: IO_WR, addr: A[15:0]@T1↑, data: D[7:0]@T2↑,
+    waits: 1 + count_of_additional_TW }</pre>
+
+<h3>Memory read and I/O read — state diagrams (side by side)</h3>
+
+<div class="diagram-container">
+<svg width="100%" viewBox="0 0 680 560" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="a3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="th" x="175" y="16" text-anchor="middle">Memory read — fig. 6</text>
+<text class="th" x="505" y="16" text-anchor="middle">I/O read — fig. 7</text>
+<g class="c-teal"><rect x="50" y="34" width="250" height="56" rx="8" stroke-width="0.5"/><text class="th" x="175" y="52" text-anchor="middle" dominant-baseline="central">T1 ↑  addr valid</text><text class="ts" x="175" y="72" text-anchor="middle" dominant-baseline="central">► capture address</text></g>
+<line x1="175" y1="90" x2="175" y2="104" class="arr" marker-end="url(#a3)"/>
+<g class="c-gray"><rect x="50" y="104" width="250" height="44" rx="8" stroke-width="0.5"/><text class="th" x="175" y="126" text-anchor="middle" dominant-baseline="central">T1 ↓  /MREQ ↓  /RD ↓</text></g>
+<line x1="175" y1="148" x2="175" y2="162" class="arr" marker-end="url(#a3)"/>
+<g class="c-gray"><rect x="50" y="162" width="250" height="44" rx="8" stroke-width="0.5"/><text class="th" x="175" y="184" text-anchor="middle" dominant-baseline="central">T2 ↑  memory responding</text></g>
+<line x1="175" y1="206" x2="175" y2="220" class="arr" marker-end="url(#a3)"/>
+<g class="c-purple"><rect x="50" y="220" width="250" height="44" rx="8" stroke-width="0.5"/><text class="th" x="175" y="242" text-anchor="middle" dominant-baseline="central">T2 ↓  sample /WAIT</text></g>
+<path d="M300 234 L322 234 L322 254 L300 254" fill="none" class="arr" marker-end="url(#a3)"/><text class="ts" x="330" y="248">TW</text>
+<line x1="175" y1="264" x2="175" y2="282" class="arr" marker-end="url(#a3)"/>
+<g class="c-gray"><rect x="50" y="282" width="250" height="44" rx="8" stroke-width="0.5"/><text class="th" x="175" y="304" text-anchor="middle" dominant-baseline="central">T3 ↑  /MREQ ↑  /RD ↑</text></g>
+<line x1="175" y1="326" x2="175" y2="340" class="arr" marker-end="url(#a3)"/>
+<g class="c-teal"><rect x="50" y="340" width="250" height="56" rx="8" stroke-width="0.5"/><text class="th" x="175" y="358" text-anchor="middle" dominant-baseline="central">T3 ↓  ► capture D[7:0]</text><text class="ts" x="175" y="378" text-anchor="middle" dominant-baseline="central">→ next cycle</text></g>
+<g class="c-teal"><rect x="380" y="34" width="250" height="56" rx="8" stroke-width="0.5"/><text class="th" x="505" y="52" text-anchor="middle" dominant-baseline="central">T1 ↑  port addr valid</text><text class="ts" x="505" y="72" text-anchor="middle" dominant-baseline="central">► capture A[15:0]</text></g>
+<line x1="505" y1="90" x2="505" y2="104" class="arr" marker-end="url(#a3)"/>
+<g class="c-gray"><rect x="380" y="104" width="250" height="44" rx="8" stroke-width="0.5"/><text class="th" x="505" y="126" text-anchor="middle" dominant-baseline="central">T1 ↓  (no /MREQ)</text></g>
+<line x1="505" y1="148" x2="505" y2="162" class="arr" marker-end="url(#a3)"/>
+<g class="c-gray"><rect x="380" y="162" width="250" height="44" rx="8" stroke-width="0.5"/><text class="th" x="505" y="184" text-anchor="middle" dominant-baseline="central">T2 ↑  /IORQ ↓  /RD ↓</text></g>
+<line x1="505" y1="206" x2="505" y2="220" class="arr" marker-end="url(#a3)"/>
+<g class="c-amber"><rect x="380" y="220" width="250" height="56" rx="8" stroke-width="0.5"/><text class="th" x="505" y="238" text-anchor="middle" dominant-baseline="central">TW* ↓  sample /WAIT</text><text class="ts" x="505" y="258" text-anchor="middle" dominant-baseline="central">auto-inserted, always present</text></g>
+<path d="M630 238 L652 238 L652 258 L630 258" fill="none" class="arr" marker-end="url(#a3)"/><text class="ts" x="647" y="252" text-anchor="end">TW</text>
+<line x1="505" y1="276" x2="505" y2="282" class="arr" marker-end="url(#a3)"/>
+<g class="c-gray"><rect x="380" y="282" width="250" height="44" rx="8" stroke-width="0.5"/><text class="th" x="505" y="304" text-anchor="middle" dominant-baseline="central">T3 ↑  /IORQ ↑  /RD ↑</text></g>
+<line x1="505" y1="326" x2="505" y2="340" class="arr" marker-end="url(#a3)"/>
+<g class="c-teal"><rect x="380" y="340" width="250" height="56" rx="8" stroke-width="0.5"/><text class="th" x="505" y="358" text-anchor="middle" dominant-baseline="central">T3 ↓  ► capture D[7:0]</text><text class="ts" x="505" y="378" text-anchor="middle" dominant-baseline="central">→ next cycle</text></g>
+<line class="leader" x1="50" y1="420" x2="630" y2="420"/>
+<text class="th" x="175" y="444" text-anchor="middle">Memory write differs:</text>
+<text class="ts" x="175" y="462" text-anchor="middle">T1 ↓: /MREQ ↓ (no /RD)</text>
+<text class="ts" x="175" y="478" text-anchor="middle">T2 ↑: /WR ↓ → ► capture D[7:0]</text>
+<text class="ts" x="175" y="494" text-anchor="middle">T3 ↑: /WR ↑ (hold time met)</text>
+<text class="ts" x="175" y="510" text-anchor="middle">T3 ↓: /MREQ ↑, bus released</text>
+<text class="th" x="505" y="444" text-anchor="middle">I/O write differs:</text>
+<text class="ts" x="505" y="462" text-anchor="middle">T2 ↑: /IORQ ↓  /WR ↓ (not /RD)</text>
+<text class="ts" x="505" y="478" text-anchor="middle">T2 ↑: ► capture D[7:0] at ↑</text>
+<text class="ts" x="505" y="494" text-anchor="middle">T3 ↑: /WR ↑  /IORQ ↑</text>
+<text class="ts" x="505" y="510" text-anchor="middle">same auto-wait applies</text>
+<text class="th" x="340" y="545" text-anchor="middle">All non-M1 reads: data captured at falling edge of T3</text>
+</svg>
+</div>
+
+<h3>4.6 INTERRUPT ACKNOWLEDGE — Ref: Figure 9</h3>
+
+<pre>Entry: /M1 goes low at T1↑, but /MREQ does NOT go low at T1↓.
+       Instead, /IORQ goes low (with /M1 still low) at T2↓.
+
+IMPORTANT: Two automatic wait states are always inserted to allow
+time for a daisy-chain priority resolution to propagate.
+The interrupt vector on D[7:0] depends on the interrupt mode:
+  Mode 0: any instruction (typically RST)
+  Mode 1: ignored (CPU jumps to 0038h)
+  Mode 2: low byte of vector table pointer (high byte = I register)
+
+Capture record:
+  { type: INT_ACK, addr: A[15:0]@T1↑, data: D[7:0]@T3↓,
+    waits: 2 + count_of_additional_TW }</pre>
+
+<div class="diagram-container">
+<svg width="100%" viewBox="0 0 680 570" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="a4" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="th" x="40" y="16">Interrupt acknowledge — ref: fig. 9</text>
+<g class="c-teal"><rect x="70" y="34" width="290" height="56" rx="8" stroke-width="0.5"/><text class="th" x="215" y="52" text-anchor="middle" dominant-baseline="central">T1 ↑  /M1 ↓, addr = PC</text><text class="ts" x="215" y="72" text-anchor="middle" dominant-baseline="central">► capture addr (PC at interrupt)</text></g>
+<line x1="215" y1="90" x2="215" y2="106" class="arr" marker-end="url(#a4)"/>
+<g class="c-coral"><rect x="70" y="106" width="290" height="56" rx="8" stroke-width="0.5"/><text class="th" x="215" y="124" text-anchor="middle" dominant-baseline="central">T1 ↓  /MREQ stays HIGH</text><text class="ts" x="215" y="144" text-anchor="middle" dominant-baseline="central">key: distinguishes from M1 fetch</text></g>
+<line class="leader" x1="362" y1="130" x2="398" y2="130"/><text class="ts" x="404" y="126">if /MREQ went low here,</text><text class="ts" x="404" y="142">this would be an opcode fetch</text>
+<line x1="215" y1="162" x2="215" y2="178" class="arr" marker-end="url(#a4)"/>
+<g class="c-gray"><rect x="70" y="178" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="200" text-anchor="middle" dominant-baseline="central">T2 ↓  /IORQ ↓</text></g>
+<line class="leader" x1="362" y1="200" x2="398" y2="200"/><text class="ts" x="404" y="196">/IORQ + /M1 both low =</text><text class="ts" x="404" y="212">interrupt acknowledge signal</text>
+<line x1="215" y1="222" x2="215" y2="238" class="arr" marker-end="url(#a4)"/>
+<g class="c-amber"><rect x="70" y="238" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="260" text-anchor="middle" dominant-baseline="central">TW1* ↓  auto wait #1</text></g>
+<line class="leader" x1="362" y1="260" x2="398" y2="260"/><text class="ts" x="404" y="256">daisy-chain priority</text><text class="ts" x="404" y="272">resolution propagating</text>
+<line x1="215" y1="282" x2="215" y2="298" class="arr" marker-end="url(#a4)"/>
+<g class="c-amber"><rect x="70" y="298" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="320" text-anchor="middle" dominant-baseline="central">TW2* ↓  auto wait #2</text></g>
+<line x1="215" y1="342" x2="215" y2="358" class="arr" marker-end="url(#a4)"/>
+<g class="c-purple"><rect x="70" y="358" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="380" text-anchor="middle" dominant-baseline="central">sample /WAIT</text></g>
+<path d="M360 372 L382 372 L382 392 L360 392" fill="none" class="arr" marker-end="url(#a4)"/><text class="ts" x="390" y="386">TW</text>
+<line x1="215" y1="402" x2="215" y2="418" class="arr" marker-end="url(#a4)"/>
+<g class="c-gray"><rect x="70" y="418" width="290" height="44" rx="8" stroke-width="0.5"/><text class="th" x="215" y="440" text-anchor="middle" dominant-baseline="central">T3 ↑  /IORQ ↑  /M1 ↑</text></g>
+<line x1="215" y1="462" x2="215" y2="478" class="arr" marker-end="url(#a4)"/>
+<g class="c-teal"><rect x="70" y="478" width="290" height="56" rx="8" stroke-width="0.5"/><text class="th" x="215" y="496" text-anchor="middle" dominant-baseline="central">T3 ↓  ► capture D[7:0]</text><text class="ts" x="215" y="516" text-anchor="middle" dominant-baseline="central">interrupt vector byte</text></g>
+<line class="leader" x1="362" y1="500" x2="398" y2="500"/><text class="ts" x="404" y="492">mode 0: instruction (RST nn)</text><text class="ts" x="404" y="508">mode 1: ignored (jump 0038h)</text><text class="ts" x="404" y="524">mode 2: low byte of vector ptr</text>
+<text class="ts" x="215" y="554" text-anchor="middle">then: T4 refresh (same as M1 fetch), followed by PUSH PC + jump to ISR</text>
+</svg>
+</div>
+
+<h3>4.7–4.10 Bus request, HALT, NMI, RESET — state diagrams</h3>
+
+<div class="diagram-container">
+<svg width="100%" viewBox="0 0 680 490" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="a5" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="th" x="40" y="18">Bus request / acknowledge — fig. 8</text>
+<g class="c-coral"><rect x="40" y="32" width="130" height="56" rx="8" stroke-width="0.5"/><text class="th" x="105" y="50" text-anchor="middle" dominant-baseline="central">/BUSREQ low</text><text class="ts" x="105" y="70" text-anchor="middle" dominant-baseline="central">at last T ↑</text></g>
+<line x1="170" y1="60" x2="196" y2="60" class="arr" marker-end="url(#a5)"/>
+<g class="c-gray"><rect x="198" y="32" width="144" height="56" rx="8" stroke-width="0.5"/><text class="th" x="270" y="50" text-anchor="middle" dominant-baseline="central">next CLK ↑</text><text class="ts" x="270" y="70" text-anchor="middle" dominant-baseline="central">Hi-Z, /BUSACK ↓</text></g>
+<line x1="342" y1="60" x2="368" y2="60" class="arr" marker-end="url(#a5)"/>
+<g class="c-amber"><rect x="370" y="32" width="130" height="56" rx="8" stroke-width="0.5"/><text class="th" x="435" y="50" text-anchor="middle" dominant-baseline="central">each Tx ↑</text><text class="ts" x="435" y="70" text-anchor="middle" dominant-baseline="central">check /BUSREQ</text></g>
+<path d="M435 88 C435 108 475 108 475 88" fill="none" class="arr"/>
+<path d="M475 88 L475 32 L458 32" fill="none" class="arr" marker-end="url(#a5)"/><text class="ts" x="490" y="78">still low</text>
+<line x1="500" y1="60" x2="526" y2="60" class="arr" marker-end="url(#a5)"/>
+<g class="c-teal"><rect x="528" y="32" width="120" height="56" rx="8" stroke-width="0.5"/><text class="th" x="588" y="50" text-anchor="middle" dominant-baseline="central">/BUSACK ↑</text><text class="ts" x="588" y="70" text-anchor="middle" dominant-baseline="central">resume at T1</text></g>
+<text class="ts" x="270" y="106" text-anchor="middle">no /INT or /NMI serviced during bus release — DMA controller handles refresh if needed</text>
+<line class="leader" x1="40" y1="126" x2="640" y2="126"/>
+<text class="th" x="40" y="144">HALT state — figs. 11, 12</text>
+<g class="c-gray"><rect x="40" y="158" width="130" height="56" rx="8" stroke-width="0.5"/><text class="th" x="105" y="176" text-anchor="middle" dominant-baseline="central">HALT instr</text><text class="ts" x="105" y="196" text-anchor="middle" dominant-baseline="central">/HALT ↓</text></g>
+<line x1="170" y1="186" x2="196" y2="186" class="arr" marker-end="url(#a5)"/>
+<g class="c-amber"><rect x="198" y="158" width="150" height="56" rx="8" stroke-width="0.5"/><text class="th" x="273" y="176" text-anchor="middle" dominant-baseline="central">M1 fetch (NOP)</text><text class="ts" x="273" y="196" text-anchor="middle" dominant-baseline="central">PC unchanged</text></g>
+<path d="M273 214 C273 234 313 234 313 214" fill="none" class="arr"/>
+<path d="M313 214 L313 158 L296 158" fill="none" class="arr" marker-end="url(#a5)"/><text class="ts" x="328" y="198">repeat</text>
+<line x1="348" y1="186" x2="374" y2="186" class="arr" marker-end="url(#a5)"/>
+<g class="c-purple"><rect x="376" y="158" width="130" height="56" rx="8" stroke-width="0.5"/><text class="th" x="441" y="176" text-anchor="middle" dominant-baseline="central">T4 ↑ each M1</text><text class="ts" x="441" y="196" text-anchor="middle" dominant-baseline="central">check /INT /NMI</text></g>
+<line x1="506" y1="186" x2="532" y2="186" class="arr" marker-end="url(#a5)"/>
+<g class="c-teal"><rect x="534" y="158" width="114" height="56" rx="8" stroke-width="0.5"/><text class="th" x="591" y="176" text-anchor="middle" dominant-baseline="central">exit HALT</text><text class="ts" x="591" y="196" text-anchor="middle" dominant-baseline="central">INT or NMI ack</text></g>
+<text class="ts" x="273" y="250" text-anchor="middle">refresh continues normally — same M1 T3/T4 refresh as opcode fetch</text>
+<line class="leader" x1="40" y1="270" x2="640" y2="270"/>
+<text class="th" x="40" y="288">NMI response — fig. 10</text>
+<g class="c-coral"><rect x="40" y="302" width="120" height="56" rx="8" stroke-width="0.5"/><text class="th" x="100" y="320" text-anchor="middle" dominant-baseline="central">/NMI edge ↓</text><text class="ts" x="100" y="340" text-anchor="middle" dominant-baseline="central">at last T ↑</text></g>
+<line x1="160" y1="330" x2="186" y2="330" class="arr" marker-end="url(#a5)"/>
+<g class="c-gray"><rect x="188" y="302" width="136" height="56" rx="8" stroke-width="0.5"/><text class="th" x="256" y="320" text-anchor="middle" dominant-baseline="central">phantom M1</text><text class="ts" x="256" y="340" text-anchor="middle" dominant-baseline="central">fetched byte ignored</text></g>
+<line x1="324" y1="330" x2="350" y2="330" class="arr" marker-end="url(#a5)"/>
+<g class="c-blue"><rect x="352" y="302" width="130" height="56" rx="8" stroke-width="0.5"/><text class="th" x="417" y="320" text-anchor="middle" dominant-baseline="central">PUSH PC</text><text class="ts" x="417" y="340" text-anchor="middle" dominant-baseline="central">2 × mem write</text></g>
+<line x1="482" y1="330" x2="508" y2="330" class="arr" marker-end="url(#a5)"/>
+<g class="c-teal"><rect x="510" y="302" width="130" height="56" rx="8" stroke-width="0.5"/><text class="th" x="575" y="320" text-anchor="middle" dominant-baseline="central">PC ← 0066h</text><text class="ts" x="575" y="340" text-anchor="middle" dominant-baseline="central">execute ISR</text></g>
+<text class="ts" x="256" y="376" text-anchor="middle">bus-indistinguishable from normal M1 — analyzer must track /NMI edge to flag it</text>
+<line class="leader" x1="40" y1="396" x2="640" y2="396"/>
+<text class="th" x="40" y="414">RESET</text>
+<g class="c-coral"><rect x="60" y="428" width="150" height="56" rx="8" stroke-width="0.5"/><text class="th" x="135" y="446" text-anchor="middle" dominant-baseline="central">/RESET low</text><text class="ts" x="135" y="466" text-anchor="middle" dominant-baseline="central">held ≥ 3 CLK</text></g>
+<line x1="210" y1="456" x2="256" y2="456" class="arr" marker-end="url(#a5)"/>
+<g class="c-gray"><rect x="258" y="428" width="150" height="56" rx="8" stroke-width="0.5"/><text class="th" x="333" y="446" text-anchor="middle" dominant-baseline="central">buses Hi-Z</text><text class="ts" x="333" y="466" text-anchor="middle" dominant-baseline="central">controls inactive</text></g>
+<line x1="408" y1="456" x2="454" y2="456" class="arr" marker-end="url(#a5)"/>
+<g class="c-teal"><rect x="456" y="428" width="180" height="56" rx="8" stroke-width="0.5"/><text class="th" x="546" y="446" text-anchor="middle" dominant-baseline="central">/RESET ↑ release</text><text class="ts" x="546" y="466" text-anchor="middle" dominant-baseline="central">PC=0, IM0, IFF=0</text></g>
+</svg>
+</div>
+
+<h2>6. T-State Counting and CLK Edge Actions</h2>
+
+<h3>Rising Edge (CLK ↑)</h3>
+
+<table>
+<tr><th>State</th><th>T</th><th>Action</th></tr>
+<tr><td>Any cycle</td><td>T1</td><td>Capture A[15:0]. Check /M1. Begin cycle ID.</td></tr>
+<tr><td>M1_FETCH</td><td>T3</td><td>Capture D[7:0] = opcode. /MREQ↑, /RD↑.</td></tr>
+<tr><td>M1_FETCH</td><td>T4</td><td>/RFSH↑, /M1↑. Sample /BUSREQ, /INT, /NMI.</td></tr>
+<tr><td>MEM_READ</td><td>T3</td><td>/MREQ↑, /RD↑. (data still valid, captured at ↓)</td></tr>
+<tr><td>MEM_WRITE</td><td>T2</td><td>Capture D[7:0] = write data. /WR↓ goes active.</td></tr>
+<tr><td>MEM_WRITE</td><td>T3</td><td>/WR↑ (data hold satisfied).</td></tr>
+<tr><td>IO_READ</td><td>T2</td><td>/IORQ↓, /RD↓.</td></tr>
+<tr><td>IO_READ</td><td>T3</td><td>/IORQ↑, /RD↑. (data still valid, captured at ↓)</td></tr>
+<tr><td>IO_WRITE</td><td>T2</td><td>/IORQ↓, /WR↓. Capture D[7:0] = write data.</td></tr>
+<tr><td>IO_WRITE</td><td>T3</td><td>/WR↑, /IORQ↑.</td></tr>
+<tr><td>INT_ACK</td><td>T3</td><td>/IORQ↑, /M1↑. (data still valid, captured at ↓)</td></tr>
+<tr><td>BUS_RELEASED</td><td>Tx</td><td>Sample /BUSREQ. If high → exit to IDLE.</td></tr>
+</table>
+
+<h3>Falling Edge (CLK ↓)</h3>
+
+<table>
+<tr><th>State</th><th>T</th><th>Action</th></tr>
+<tr><td>M1_FETCH</td><td>T1</td><td>/MREQ↓, /RD↓. Confirms fetch (vs INT_ACK).</td></tr>
+<tr><td>M1_FETCH</td><td>T2</td><td>Sample /WAIT. If low → enter TW.</td></tr>
+<tr><td>M1_FETCH</td><td>TW</td><td>Sample /WAIT. If low → repeat TW. If high → T3.</td></tr>
+<tr><td>M1_FETCH</td><td>T3</td><td>/MREQ↓ (refresh). Capture refresh addr A[6:0].</td></tr>
+<tr><td>MEM_READ</td><td>T1</td><td>/MREQ↓, /RD↓.</td></tr>
+<tr><td>MEM_READ</td><td>T2</td><td>Sample /WAIT.</td></tr>
+<tr><td>MEM_READ</td><td>TW</td><td>Sample /WAIT.</td></tr>
+<tr><td>MEM_READ</td><td>T3</td><td>► Capture D[7:0] = read data.</td></tr>
+<tr><td>MEM_WRITE</td><td>T1</td><td>/MREQ↓.</td></tr>
+<tr><td>MEM_WRITE</td><td>T2</td><td>Sample /WAIT.</td></tr>
+<tr><td>MEM_WRITE</td><td>TW</td><td>Sample /WAIT.</td></tr>
+<tr><td>IO_READ</td><td>TW*</td><td>Sample /WAIT (auto-inserted wait).</td></tr>
+<tr><td>IO_READ</td><td>TW</td><td>Sample /WAIT (additional waits).</td></tr>
+<tr><td>IO_READ</td><td>T3</td><td>► Capture D[7:0] = read data.</td></tr>
+<tr><td>IO_WRITE</td><td>TW*</td><td>Sample /WAIT.</td></tr>
+<tr><td>IO_WRITE</td><td>TW</td><td>Sample /WAIT.</td></tr>
+<tr><td>INT_ACK</td><td>T2</td><td>/IORQ↓.</td></tr>
+<tr><td>INT_ACK</td><td>TW1*</td><td>Sample /WAIT (first auto wait).</td></tr>
+<tr><td>INT_ACK</td><td>TW2*</td><td>Sample /WAIT (second auto wait).</td></tr>
+<tr><td>INT_ACK</td><td>TW</td><td>Sample /WAIT (additional).</td></tr>
+<tr><td>INT_ACK</td><td>T3</td><td>► Capture D[7:0] = interrupt vector.</td></tr>
+</table>
+
+<h2>7. Capture Record Format</h2>
+
+<pre>struct TraceRecord {
+    cycle_type:   enum { M1_FETCH, MEM_RD, MEM_WR,
+                         IO_RD, IO_WR, INT_ACK,
+                         BUS_RELEASED, RESET },
+    address:      u16,          // A[15:0] captured at T1↑
+    data:         u8,           // D[7:0] — sample edge depends on cycle:
+                                 //   M1_FETCH: T3↑ (rising edge)
+                                 //   MEM_RD:   T3↓ (falling edge)
+                                 //   MEM_WR:   T2↑ (rising edge)
+                                 //   IO_RD:    T3↓ (falling edge)
+                                 //   IO_WR:    T2↑ (rising edge)
+                                 //   INT_ACK:  T3↓ (falling edge)
+    refresh_addr: u7,           // only for M1_FETCH: A[6:0] at T3↓
+    wait_count:   u8,           // number of TW states inserted
+    halt:         bool,         // /HALT was active during this cycle
+    clk_count:    u32,          // absolute CLK count for timestamp
+    signals:      SignalSnapshot // optional: all signal levels at capture
+}</pre>
+
+<h2>8. Discrimination Timing — Critical Windows</h2>
+
+<pre>CLK ↑ (T1)
+  │
+  ├─ /M1 low? ──────────────────── YES → M1 class cycle
+  │                                        │
+  │  CLK ↓ (T1)                            │
+  │    │                                   │
+  │    ├─ /MREQ low? ──── YES → OPCODE FETCH
+  │    │                   NO  → INT_ACK (confirm at T2: /IORQ↓)
+  │    │
+  │    ├─ /MREQ low?
+  │    │    YES → Memory cycle
+  │    │           /RD low → MEM_READ
+  │    │           (else)  → MEM_WRITE (confirmed when /WR↓ at T2↑)
+  │    │    NO  → I/O cycle (confirmed at T2↑ when /IORQ↓)
+  │    │           /RD↓ → IO_READ
+  │    │           /WR↓ → IO_WRITE
+  │
+  ├─ /BUSACK low? ──────────────── YES → BUS_RELEASED
+  ├─ /RESET low? ───────────────── YES → RESET
+  └─ else → continue in current multi-T-state cycle</pre>
+
+<h2>9. Practical Considerations for Analyzer Implementation</h2>
+
+<h3>9.1 What the analyzer CANNOT see from bus signals alone</h3>
+
+<p><strong>Instruction boundaries:</strong> The analyzer knows M1 fetches start a new instruction, but multi-byte instructions (prefixed with CB, DD, ED, FD) have multiple M1-like fetches. The analyzer must decode opcodes to know how many M cycles an instruction has and what types they are.</p>
+
+<p><strong>Interrupt mode:</strong> The CPU's current IM setting (0, 1, or 2) is internal state. The analyzer must track IM instructions to know how to interpret the INT_ACK vector byte.</p>
+
+<p><strong>IFF state:</strong> Whether interrupts are enabled. Must track EI/DI/RETN.</p>
+
+<p><strong>Stack pointer value:</strong> Must track SP-modifying instructions to annotate PUSH/POP/CALL/RET memory accesses.</p>
+
+<h3>9.2 M1 cycle length ambiguity</h3>
+
+<p>Standard M1 is 4 T-states (T1-T2-T3-T4). But the manual states the first M cycle "is four, five, or six T cycles long." The 5/6 T-state M1 cycles occur with DD/FD/CB/ED prefix handling and certain instructions. The analyzer handles this because T4 is always followed by either another T1 (with /M1 going low again for another fetch) or by the continuation of the internal operation. The signals on the bus during the extra T-states look like "internal operation" — no /MREQ, /IORQ, /RD, /WR activity. The analyzer should detect these as idle bus states within the instruction.</p>
+
+<h3>9.3 Suggested implementation approach</h3>
+
+<pre>on every CLK rising edge:
+    if /RESET = low:
+        state = RESET; return
+    if /BUSACK = low:
+        state = BUS_RELEASED; return
+    if state expects T1:
+        capture address
+        if /M1 = low:
+            cycle_class = M1
+        else:
+            cycle_class = NON_M1
+        advance to T1_done, wait for falling edge
+
+on every CLK falling edge:
+    if in T1 and cycle_class = M1:
+        if /MREQ = low:
+            cycle_type = OPCODE_FETCH
+        else:
+            cycle_type = INT_ACK
+    if in T1 and cycle_class = NON_M1:
+        if /MREQ = low:
+            cycle_type = (will check /RD vs /WR next)
+        else:
+            pending_IO = true  (confirm at T2↑)
+    if in T2 or TW:
+        check /WAIT → insert or exit wait states
+    ...proceed through cycle state machine...</pre>
+
+<h2>10. Cross-Reference to Manual Figures</h2>
+
+<table>
+<tr><th>Figure</th><th>Manual Page</th><th>State Machine Section</th><th>Cycle Type</th></tr>
+<tr><td>Fig. 4</td><td>p. 8</td><td>§2 Overview</td><td>General M/T structure</td></tr>
+<tr><td>Fig. 5</td><td>p. 9</td><td>§4.1</td><td>Opcode Fetch (M1)</td></tr>
+<tr><td>Fig. 6</td><td>p. 10</td><td>§4.2, §4.3</td><td>Memory Read/Write</td></tr>
+<tr><td>Fig. 7</td><td>p. 11</td><td>§4.4, §4.5</td><td>I/O Read/Write</td></tr>
+<tr><td>Fig. 8</td><td>p. 12</td><td>§4.7</td><td>Bus Req/Ack</td></tr>
+<tr><td>Fig. 9</td><td>p. 13</td><td>§4.6</td><td>Interrupt Ack</td></tr>
+<tr><td>Fig. 10</td><td>p. 14</td><td>§4.8</td><td>NMI Response</td></tr>
+<tr><td>Fig. 11</td><td>p. 15</td><td>§4.9</td><td>HALT Exit</td></tr>
+<tr><td>Fig. 12</td><td>p. 15</td><td>§4.10 (partial)</td><td>Power-Down Ack</td></tr>
+<tr><td>Fig. 13–15</td><td>p. 16</td><td>§4.10</td><td>Power-Down Release</td></tr>
+</table>
+
+<h2>11. Open Questions for Review</h2>
+
+<p><strong>1. I/O auto-wait counting:</strong> The manual shows TW* between T2 and T3 in Fig. 7. The manual text says "During this wait state period, the WAIT request signal is sampled" — confirming /WAIT IS sampled during TW*. The analyzer should count TW* as wait_count=1, and additional TWs increment from there.</p>
+
+<p><strong>2. INT ACK auto-waits:</strong> Fig. 9 shows TW*, TW* (two automatic waits). Same question — /WAIT is sampled during each, and additional waits can be added. This needs verification from the timing spec (whether /WAIT is checked after TW1*, after TW2*, or only after TW2*).</p>
+
+<p><strong>3. DD/FD prefix M1 extension:</strong> When the CPU fetches a DD or FD prefix, does the subsequent M1 fetch for the actual opcode look like a normal M1 on the bus? (Yes — it's a separate M1 cycle.) The analyzer needs opcode decode to group them.</p>
+
+<p><strong>4. NMI phantom fetch:</strong> The M1 fetch during NMI acknowledge reads a byte from (PC) but discards it. The analyzer records this as a normal M1_FETCH. Is there any bus-visible difference? (No — only /NMI edge history distinguishes it.)</p>
+
+<p><strong>5. HALT M1 address:</strong> During HALT, does the PC increment for each NOP M1 fetch, or does it stay constant? (PC does NOT increment — the CPU re-fetches the same address, the HALT instruction itself, but forces NOP internally.) The analyzer should see the same address repeating.</p>
+
+</body>
+</html>
