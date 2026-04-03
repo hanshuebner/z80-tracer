@@ -100,14 +100,19 @@ static inline uint32_t dma_write_index(void) {
 // Z80 Bus Analyzer State Machine — runs on core 1
 // ========================================================================
 //
-// Processes raw CLK-edge samples from the PIO/DMA ring buffer and produces
-// trace_record_t for each completed machine cycle.
+// Optimized for throughput: each sample must be processed in ~19 ARM
+// cycles at 150 MHz to keep up with a 4 MHz Z80 (8M samples/sec).
 //
-// Synchronization: the state machine can attach mid-stream. In IDLE state
-// it waits for a rising edge where /M1 is low (unambiguous start of M1
-// cycle) or where /MREQ goes low at the subsequent falling edge (memory
-// cycle start). Internal operation T-states are detected and discarded
-// by re-interpreting the current rising edge as a new potential T1.
+// Key optimizations:
+//  - Lazy signal extraction: each state only reads the signals it needs
+//  - Flow control (queue_get_level with spinlock) only runs when emitting
+//    records (~1.3M/sec), not on every sample (8M/sec)
+//  - /RESET checked only on rising edges (~4M/sec)
+//  - gpio_hi_in read only in states that need /WAIT, /INT, /NMI
+//
+// Synchronization: in sync mode, IDLE only accepts M1 cycles (/M1 low
+// at T1↑). Internal operation T-states are handled by re-interpreting
+// the current rising edge as a new potential T1.
 
 // ---- Analyzer states ----
 
@@ -198,7 +203,6 @@ static struct {
     bool     has_pending;
 
     // Synchronization: when true, IDLE only accepts M1 cycles
-    // (where /M1 is unambiguously low at T1↑)
     bool     syncing;
 } az;
 
@@ -212,22 +216,13 @@ static inline void wait_release(void) {
     gpio_set_dir(PIN_WAIT, GPIO_IN);   // release (open-drain)
 }
 
-// Read /WAIT pin state (true = active/asserted, regardless of who drives it)
-static inline bool read_wait(void) {
-    return !(sio_hw->gpio_hi_in & (1u << (PIN_WAIT - 32)));
-}
-
-// Read /INT, /NMI, /RESET from high GPIO bank
-static inline uint32_t read_hi_gpio(void) {
-    return sio_hw->gpio_hi_in;
-}
-
 #define HI_WAIT_BIT   (1u << (PIN_WAIT  - 32))
 #define HI_INT_BIT    (1u << (PIN_INT   - 32))
 #define HI_NMI_BIT    (1u << (PIN_NMI   - 32))
 #define HI_RESET_BIT  (1u << (PIN_RESET - 32))
 
 // ---- Emit a completed trace record ----
+// Flow control check happens here (not on every sample).
 
 static void emit_record(uint8_t cycle_type) {
     trace_record_t rec;
@@ -242,36 +237,18 @@ static void emit_record(uint8_t cycle_type) {
     if (az.int_pending) rec.flags |= TRACE_FLAG_INT;
     if (az.nmi_pending) rec.flags |= TRACE_FLAG_NMI;
 
-    // Try to enqueue; if full, save as pending and assert /WAIT
     if (!queue_try_add(&trace_queue, &rec)) {
         az.pending = rec;
         az.has_pending = true;
         wait_assert();
-    }
-
-    // Clear NMI pending (edge-triggered, consumed once reported)
-    az.nmi_pending = false;
-}
-
-// Try to flush a pending record that couldn't be queued earlier
-static inline void try_flush_pending(void) {
-    if (az.has_pending) {
-        if (queue_try_add(&trace_queue, &az.pending)) {
-            az.has_pending = false;
-        }
-    }
-}
-
-// Update flow control based on queue level
-static inline void update_flow_control(void) {
-    if (!az.has_pending) {
+    } else {
+        // Flow control: only checked when a record is emitted
         uint32_t level = queue_get_level(&trace_queue);
-        if (level >= FLOW_CTRL_ASSERT_THRESHOLD) {
+        if (level >= FLOW_CTRL_ASSERT_THRESHOLD)
             wait_assert();
-        } else if (level <= FLOW_CTRL_RELEASE_THRESHOLD) {
-            wait_release();
-        }
     }
+
+    az.nmi_pending = false;
 }
 
 // ---- Begin a new cycle at T1↑ ----
@@ -285,52 +262,16 @@ static inline void begin_cycle(uint32_t sample) {
 }
 
 // ---- Process one PIO sample ----
+// Each state extracts only the signals it needs (lazy extraction).
 
 static void process_sample(uint32_t sample) {
-    bool clk_high = (sample & SAMPLE_CLK_BIT) != 0;
 
-    // Read high-bank GPIO for /RESET, /INT, /NMI
-    uint32_t hi = read_hi_gpio();
-    bool reset_active = !(hi & HI_RESET_BIT);
-    bool int_active   = !(hi & HI_INT_BIT);
-    bool nmi_active   = !(hi & HI_NMI_BIT);
-    bool wait_active  = !(hi & HI_WAIT_BIT);
-
-    // /RESET overrides everything
-    if (reset_active) {
+    // /RESET check on rising edges only (~4 cycles overhead, 4M/sec)
+    if ((sample & SAMPLE_CLK_BIT) &&
+        __builtin_expect(!(sio_hw->gpio_hi_in & HI_RESET_BIT), 0)) {
         az.state = ST_RESET;
         return;
     }
-    if (az.state == ST_RESET) {
-        // Exiting reset — flush any pending record first, then emit RESET
-        if (az.has_pending) {
-            if (!queue_try_add(&trace_queue, &az.pending)) {
-                return;  // queue still full — stay in ST_RESET until flushed
-            }
-            az.has_pending = false;
-        }
-        az.address = 0;
-        az.data = 0;
-        az.refresh = 0;
-        az.wait_count = 0;
-        az.halt = false;
-        az.nmi_prev = nmi_active;
-        az.nmi_pending = false;
-        az.int_pending = false;
-        emit_record(CYCLE_RESET);
-        az.state = ST_IDLE;
-        az.syncing = true;  // re-sync after reset
-        return;
-    }
-
-    // Extract signals from PIO sample
-    bool m1   = !(sample & SAMPLE_M1_BIT);
-    bool mreq = !(sample & SAMPLE_MREQ_BIT);
-    bool iorq = !(sample & SAMPLE_IORQ_BIT);
-    bool rd   = !(sample & SAMPLE_RD_BIT);
-    bool wr   = !(sample & SAMPLE_WR_BIT);
-    uint16_t addr = sample_addr(sample);
-    uint8_t  data = sample_data(sample);
 
     switch (az.state) {
 
@@ -338,47 +279,56 @@ static void process_sample(uint32_t sample) {
     // IDLE — waiting for T1 rising edge
     // ================================================================
     case ST_IDLE:
-        if (!clk_high) return;  // only act on rising edges
-
-        // Synchronization: when syncing, only accept unambiguous M1
-        // starts (/M1 low at T1↑). Once synced, accept all cycle types.
-        if (m1) {
+        if (!(sample & SAMPLE_CLK_BIT)) return;
+        if (!(sample & SAMPLE_M1_BIT)) {
             begin_cycle(sample);
             az.state = ST_T1_M1;
-            az.syncing = false;  // M1 seen — we're synchronized
+            az.syncing = false;
         } else if (!az.syncing) {
             begin_cycle(sample);
             az.state = ST_T1_NONM1;
         }
-        // else: syncing and /M1 high — skip this edge
+        break;
+
+    // ================================================================
+    // RESET
+    // ================================================================
+    case ST_RESET:
+        // Wait for /RESET to release (checked on both edges for responsiveness)
+        if (!(sio_hw->gpio_hi_in & HI_RESET_BIT)) return;  // still in reset
+        // Exiting reset — flush any pending record first
+        if (az.has_pending) {
+            if (!queue_try_add(&trace_queue, &az.pending)) return;
+            az.has_pending = false;
+        }
+        az.address = 0; az.data = 0; az.refresh = 0;
+        az.wait_count = 0; az.halt = false;
+        az.nmi_prev = !(sio_hw->gpio_hi_in & HI_NMI_BIT);
+        az.nmi_pending = false;
+        az.int_pending = false;
+        emit_record(CYCLE_RESET);
+        az.state = ST_IDLE;
+        az.syncing = true;
         break;
 
     // ================================================================
     // T1 — cycle type discrimination at falling edge
     // ================================================================
-    case ST_T1_M1:      // /M1 was low at T1↑
-        if (clk_high) return;
-        if (mreq) {
-            // /MREQ low → opcode fetch
+    case ST_T1_M1:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sample & SAMPLE_MREQ_BIT)) {
             az.state = ST_M1_T2R;
         } else {
-            // /MREQ high → interrupt acknowledge
-            az.wait_count = 2;  // two auto-inserted waits
+            az.wait_count = 2;
             az.state = ST_IA_T2R;
         }
         break;
 
-    case ST_T1_NONM1:   // /M1 was high at T1↑
-        if (clk_high) return;
-        if (mreq) {
-            // Memory cycle — /RD determines read vs write
-            if (rd) {
-                az.state = ST_MR_T2R;
-            } else {
-                az.state = ST_MW_T2R;
-            }
+    case ST_T1_NONM1:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sample & SAMPLE_MREQ_BIT)) {
+            az.state = (!(sample & SAMPLE_RD_BIT)) ? ST_MR_T2R : ST_MW_T2R;
         } else {
-            // /MREQ high: could be I/O (confirmed at T2↑) or internal op
             az.state = ST_IO_T2R;
         }
         break;
@@ -387,13 +337,13 @@ static void process_sample(uint32_t sample) {
     // M1 OPCODE FETCH — §4.1
     // ================================================================
     case ST_M1_T2R:
-        if (!clk_high) return;
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_M1_T2F;
         break;
 
-    case ST_M1_T2F:     // T2↓ — check /WAIT
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_M1_T2F:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_M1_TWR;
         } else {
@@ -401,14 +351,14 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_M1_TWR:     // TW↑
-        if (!clk_high) return;
+    case ST_M1_TWR:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_M1_TWF;
         break;
 
-    case ST_M1_TWF:     // TW↓ — check /WAIT
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_M1_TWF:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_M1_TWR;
         } else {
@@ -416,39 +366,41 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_M1_T3R:     // T3↑ — capture opcode from data bus
-        if (!clk_high) return;
-        az.data = data;
+    case ST_M1_T3R:     // capture opcode
+        if (!(sample & SAMPLE_CLK_BIT)) return;
+        az.data = sample_data(sample);
         az.state = ST_M1_T3F;
         break;
 
-    case ST_M1_T3F:     // T3↓ — capture refresh address
-        if (clk_high) return;
-        az.refresh = addr & 0x7F;
+    case ST_M1_T3F:     // capture refresh address
+        if (sample & SAMPLE_CLK_BIT) return;
+        az.refresh = sample_addr(sample) & 0x7F;
         az.state = ST_M1_T4R;
         break;
 
-    case ST_M1_T4R:     // T4↑ — sample interrupts, emit record
-        if (!clk_high) return;
-        // NMI edge detection
-        if (nmi_active && !az.nmi_prev) az.nmi_pending = true;
-        az.nmi_prev = nmi_active;
-        az.int_pending = int_active;
+    case ST_M1_T4R: {   // sample interrupts, emit
+        if (!(sample & SAMPLE_CLK_BIT)) return;
+        uint32_t hi = sio_hw->gpio_hi_in;
+        bool nmi = !(hi & HI_NMI_BIT);
+        if (nmi && !az.nmi_prev) az.nmi_pending = true;
+        az.nmi_prev = nmi;
+        az.int_pending = !(hi & HI_INT_BIT);
         emit_record(CYCLE_M1_FETCH);
         az.state = ST_IDLE;
         break;
+    }
 
     // ================================================================
     // MEMORY READ — §4.2
     // ================================================================
     case ST_MR_T2R:
-        if (!clk_high) return;
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_MR_T2F;
         break;
 
-    case ST_MR_T2F:     // T2↓ — check /WAIT
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_MR_T2F:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_MR_TWR;
         } else {
@@ -457,13 +409,13 @@ static void process_sample(uint32_t sample) {
         break;
 
     case ST_MR_TWR:
-        if (!clk_high) return;
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_MR_TWF;
         break;
 
     case ST_MR_TWF:
-        if (clk_high) return;
-        if (wait_active) {
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_MR_TWR;
         } else {
@@ -471,14 +423,14 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_MR_T3R:     // T3↑ — /MREQ↑, /RD↑ (data still valid)
-        if (!clk_high) return;
+    case ST_MR_T3R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_MR_T3F;
         break;
 
-    case ST_MR_T3F:     // T3↓ — capture read data
-        if (clk_high) return;
-        az.data = data;
+    case ST_MR_T3F:     // capture read data
+        if (sample & SAMPLE_CLK_BIT) return;
+        az.data = sample_data(sample);
         emit_record(CYCLE_MEM_READ);
         az.state = ST_IDLE;
         break;
@@ -486,15 +438,15 @@ static void process_sample(uint32_t sample) {
     // ================================================================
     // MEMORY WRITE — §4.3
     // ================================================================
-    case ST_MW_T2R:     // T2↑ — /WR goes active, capture write data
-        if (!clk_high) return;
-        az.data = data;
+    case ST_MW_T2R:     // capture write data
+        if (!(sample & SAMPLE_CLK_BIT)) return;
+        az.data = sample_data(sample);
         az.state = ST_MW_T2F;
         break;
 
-    case ST_MW_T2F:     // T2↓ — check /WAIT
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_MW_T2F:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_MW_TWR;
         } else {
@@ -503,13 +455,13 @@ static void process_sample(uint32_t sample) {
         break;
 
     case ST_MW_TWR:
-        if (!clk_high) return;
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_MW_TWF;
         break;
 
     case ST_MW_TWF:
-        if (clk_high) return;
-        if (wait_active) {
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_MW_TWR;
         } else {
@@ -517,35 +469,38 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_MW_T3R:     // T3↑ — /WR↑
-        if (!clk_high) return;
+    case ST_MW_T3R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_MW_T3F;
         break;
 
-    case ST_MW_T3F:     // T3↓ — cycle complete
-        if (clk_high) return;
+    case ST_MW_T3F:
+        if (sample & SAMPLE_CLK_BIT) return;
         emit_record(CYCLE_MEM_WRITE);
         az.state = ST_IDLE;
         break;
 
     // ================================================================
-    // I/O PENDING — §4.4/§4.5: wait for T2↑ to confirm I/O type
+    // I/O PENDING — wait for T2↑ to confirm I/O type
     // ================================================================
     case ST_IO_T2R:
-        if (!clk_high) return;
-        if (iorq && rd) {
-            // I/O read confirmed
-            az.wait_count = 1;  // auto-inserted TW*
-            az.state = ST_IR_T2F;
-        } else if (iorq && wr) {
-            // I/O write confirmed — capture write data
-            az.data = data;
-            az.wait_count = 1;  // auto-inserted TW*
-            az.state = ST_IW_T2F;
+        if (!(sample & SAMPLE_CLK_BIT)) return;
+        if (!(sample & SAMPLE_IORQ_BIT)) {
+            if (!(sample & SAMPLE_RD_BIT)) {
+                az.wait_count = 1;
+                az.state = ST_IR_T2F;
+            } else if (!(sample & SAMPLE_WR_BIT)) {
+                az.data = sample_data(sample);
+                az.wait_count = 1;
+                az.state = ST_IW_T2F;
+            } else {
+                // /IORQ active but neither /RD nor /WR — shouldn't happen
+                begin_cycle(sample);
+                az.state = ST_T1_NONM1;
+            }
         } else {
-            // Not I/O — internal operation T-state.
-            // Re-interpret this rising edge as potential T1↑ of next cycle.
-            if (m1) {
+            // Not I/O — internal operation. Re-interpret as T1↑.
+            if (!(sample & SAMPLE_M1_BIT)) {
                 begin_cycle(sample);
                 az.state = ST_T1_M1;
             } else {
@@ -558,19 +513,19 @@ static void process_sample(uint32_t sample) {
     // ================================================================
     // I/O READ — §4.4
     // ================================================================
-    case ST_IR_T2F:     // T2↓ — start of auto-wait TW*
-        if (clk_high) return;
+    case ST_IR_T2F:
+        if (sample & SAMPLE_CLK_BIT) return;
         az.state = ST_IR_TWR;
         break;
 
-    case ST_IR_TWR:     // TW↑ (auto or additional)
-        if (!clk_high) return;
+    case ST_IR_TWR:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IR_TWF;
         break;
 
-    case ST_IR_TWF:     // TW↓ — check /WAIT
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_IR_TWF:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_IR_TWR;
         } else {
@@ -578,14 +533,14 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_IR_T3R:     // T3↑ — /IORQ↑, /RD↑
-        if (!clk_high) return;
+    case ST_IR_T3R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IR_T3F;
         break;
 
-    case ST_IR_T3F:     // T3↓ — capture read data
-        if (clk_high) return;
-        az.data = data;
+    case ST_IR_T3F:
+        if (sample & SAMPLE_CLK_BIT) return;
+        az.data = sample_data(sample);
         emit_record(CYCLE_IO_READ);
         az.state = ST_IDLE;
         break;
@@ -593,19 +548,19 @@ static void process_sample(uint32_t sample) {
     // ================================================================
     // I/O WRITE — §4.5
     // ================================================================
-    case ST_IW_T2F:     // T2↓ — start of auto-wait TW*
-        if (clk_high) return;
+    case ST_IW_T2F:
+        if (sample & SAMPLE_CLK_BIT) return;
         az.state = ST_IW_TWR;
         break;
 
-    case ST_IW_TWR:     // TW↑
-        if (!clk_high) return;
+    case ST_IW_TWR:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IW_TWF;
         break;
 
-    case ST_IW_TWF:     // TW↓ — check /WAIT
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_IW_TWF:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_IW_TWR;
         } else {
@@ -613,13 +568,13 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_IW_T3R:     // T3↑ — /WR↑, /IORQ↑
-        if (!clk_high) return;
+    case ST_IW_T3R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IW_T3F;
         break;
 
-    case ST_IW_T3F:     // T3↓ — cycle complete
-        if (clk_high) return;
+    case ST_IW_T3F:
+        if (sample & SAMPLE_CLK_BIT) return;
         emit_record(CYCLE_IO_WRITE);
         az.state = ST_IDLE;
         break;
@@ -627,34 +582,34 @@ static void process_sample(uint32_t sample) {
     // ================================================================
     // INTERRUPT ACKNOWLEDGE — §4.6
     // ================================================================
-    case ST_IA_T2R:     // T2↑
-        if (!clk_high) return;
+    case ST_IA_T2R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IA_T2F;
         break;
 
-    case ST_IA_T2F:     // T2↓ — /IORQ goes low
-        if (clk_high) return;
+    case ST_IA_T2F:
+        if (sample & SAMPLE_CLK_BIT) return;
         az.state = ST_IA_TW1R;
         break;
 
-    case ST_IA_TW1R:    // TW1*↑ — first auto-wait
-        if (!clk_high) return;
+    case ST_IA_TW1R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IA_TW1F;
         break;
 
-    case ST_IA_TW1F:    // TW1*↓
-        if (clk_high) return;
+    case ST_IA_TW1F:
+        if (sample & SAMPLE_CLK_BIT) return;
         az.state = ST_IA_TW2R;
         break;
 
-    case ST_IA_TW2R:    // TW2*↑ — second auto-wait
-        if (!clk_high) return;
+    case ST_IA_TW2R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IA_TW2F;
         break;
 
-    case ST_IA_TW2F:    // TW2*↓ — check /WAIT for additional waits
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_IA_TW2F:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_IA_TWR;
         } else {
@@ -662,14 +617,14 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_IA_TWR:     // additional TW↑
-        if (!clk_high) return;
+    case ST_IA_TWR:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IA_TWF;
         break;
 
-    case ST_IA_TWF:     // additional TW↓ — check /WAIT
-        if (clk_high) return;
-        if (wait_active) {
+    case ST_IA_TWF:
+        if (sample & SAMPLE_CLK_BIT) return;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
             az.wait_count++;
             az.state = ST_IA_TWR;
         } else {
@@ -677,26 +632,28 @@ static void process_sample(uint32_t sample) {
         }
         break;
 
-    case ST_IA_T3R:     // T3↑ — /IORQ↑, /M1↑
-        if (!clk_high) return;
+    case ST_IA_T3R:
+        if (!(sample & SAMPLE_CLK_BIT)) return;
         az.state = ST_IA_T3F;
         break;
 
-    case ST_IA_T3F:     // T3↓ — capture interrupt vector
-        if (clk_high) return;
-        az.data = data;
+    case ST_IA_T3F:     // capture interrupt vector
+        if (sample & SAMPLE_CLK_BIT) return;
+        az.data = sample_data(sample);
         az.state = ST_IA_T4R;
         break;
 
-    case ST_IA_T4R:     // T4↑ — refresh done, emit record
-        if (!clk_high) return;
-        // NMI edge detection
-        if (nmi_active && !az.nmi_prev) az.nmi_pending = true;
-        az.nmi_prev = nmi_active;
-        az.int_pending = int_active;
+    case ST_IA_T4R: {   // refresh done, emit
+        if (!(sample & SAMPLE_CLK_BIT)) return;
+        uint32_t hi = sio_hw->gpio_hi_in;
+        bool nmi = !(hi & HI_NMI_BIT);
+        if (nmi && !az.nmi_prev) az.nmi_pending = true;
+        az.nmi_prev = nmi;
+        az.int_pending = !(hi & HI_INT_BIT);
         emit_record(CYCLE_INT_ACK);
         az.state = ST_IDLE;
         break;
+    }
 
     } // switch
 }
@@ -706,13 +663,11 @@ static void process_sample(uint32_t sample) {
 static void core1_main(void) {
     uint32_t tail = 0;
 
-    // Initialize analyzer state
     memset(&az, 0, sizeof(az));
     az.state = ST_IDLE;
-    az.syncing = true;  // start in sync mode — wait for first M1
+    az.syncing = true;
 
     while (true) {
-        // Check for reset signal from core 0
         if (needs_reset) {
             tail = dma_write_index();
             memset(&az, 0, sizeof(az));
@@ -722,12 +677,17 @@ static void core1_main(void) {
             needs_reset = false;
         }
 
-        // Process all available samples from DMA ring buffer
         uint32_t head = dma_write_index();
         while (tail != head) {
-            try_flush_pending();
+            // Flush pending record (only involves spinlock when pending)
+            if (__builtin_expect(az.has_pending, 0)) {
+                if (queue_try_add(&trace_queue, &az.pending)) {
+                    az.has_pending = false;
+                    uint32_t level = queue_get_level(&trace_queue);
+                    if (level <= FLOW_CTRL_RELEASE_THRESHOLD) wait_release();
+                }
+            }
             process_sample(sample_buf[tail]);
-            update_flow_control();
             tail = (tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
         }
     }
