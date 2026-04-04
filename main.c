@@ -900,7 +900,7 @@ static void cmd_read_buffer(void) {
 
     // Records after ref point (only meaningful if triggered)
     uint32_t avail_post = widx - ref_idx;
-    if (avail_post > available) avail_post = 0;
+    if (avail_post > available) avail_post = available;
     if (post_count > avail_post) post_count = avail_post;
 
     uint32_t total = pre_count + post_count;

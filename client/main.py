@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import io
 import struct
 import sys
 import time
@@ -378,7 +379,187 @@ def format_instruction(instr, reg_changes):
     return f"{addr_str}: {raw} {mnem} {comment}"
 
 
-# -- Main trace loop --
+# -- Decode records into structured output (for live capture with trimming) --
+
+def _decode_to_lines(raw_bytes, raw_output=False, detect_loops=True,
+                     filter_config=None, memory_tracer=None,
+                     show_interrupts=True, watch_ranges=None):
+    """Decode raw trace record bytes into a list of instruction entries.
+
+    Each entry is a dict:
+      {'instr_idx': int, 'record_end': int, 'lines': [str, ...]}
+
+    record_end is the record index (0-based) past the last record consumed
+    by this instruction, used to map trigger offsets to instruction indices.
+    """
+    assembler = InstructionAssembler()
+    state = Z80State()
+    loop_det = LoopDetector()
+    trace_filter = (TraceFilter(filter_config, format_instruction)
+                    if filter_config and filter_config.has_any_config else None)
+    watching = watch_ranges or []
+    watch_cur = False
+    watch_prev = False
+    raw_buf = []
+    output = []
+    instr_count = 0
+    record_idx = 0
+
+    data = raw_bytes
+    while record_idx * RECORD_SIZE + RECORD_SIZE <= len(data):
+        rec = data[record_idx * RECORD_SIZE:(record_idx + 1) * RECORD_SIZE]
+        record_idx += 1
+        cycle_type, addr, value, wait_count, halt = parse_record(rec)
+
+        if memory_tracer:
+            if cycle_type == CYCLE_OPCODE_FETCH:
+                memory_tracer.record_fetch(addr)
+            elif cycle_type == CYCLE_MEM_READ:
+                memory_tracer.record_read(addr)
+            elif cycle_type == CYCLE_MEM_WRITE:
+                memory_tracer.record_write(addr)
+
+        if watching and cycle_type in (
+                CYCLE_OPCODE_FETCH, CYCLE_MEM_READ, CYCLE_MEM_WRITE):
+            if cycle_type == CYCLE_OPCODE_FETCH:
+                watch_prev = watch_cur
+                watch_cur = False
+            for ws, we in watching:
+                if ws <= addr <= we:
+                    watch_cur = True
+                    break
+
+        if raw_output:
+            ct_name = CYCLE_NAMES[cycle_type] if cycle_type < len(CYCLE_NAMES) else "?"
+            extras = ""
+            if wait_count:
+                extras += f" W={wait_count}"
+            if halt:
+                extras += " HALT"
+            raw_buf.append(f"  {ct_name:6s} {addr:04X} {value:02X}{extras}")
+
+        filter_active = (not trace_filter or trace_filter._active)
+
+        if cycle_type == CYCLE_RESET:
+            raw_buf.clear()
+            if show_interrupts and filter_active:
+                output.append({
+                    'instr_idx': instr_count,
+                    'record_end': record_idx,
+                    'lines': ["; --- RESET ---"],
+                })
+            continue
+
+        instr = assembler.feed(cycle_type, addr, value)
+
+        int_lines = []
+        if assembler.int_ack:
+            iaddr, ivec = assembler.int_ack
+            assembler.int_ack = None
+            if show_interrupts and filter_active:
+                int_lines.append(
+                    f"; --- INT acknowledge at ${iaddr:04X}, vector=${ivec:02X} ---")
+        if assembler.nmi_detected:
+            assembler.nmi_detected = False
+            if show_interrupts and filter_active:
+                int_lines.append("; --- NMI ---")
+
+        if instr is None:
+            if int_lines:
+                output.append({
+                    'instr_idx': instr_count,
+                    'record_end': record_idx,
+                    'lines': int_lines,
+                })
+            continue
+
+        if raw_output:
+            if cycle_type == CYCLE_OPCODE_FETCH:
+                instr_raw = raw_buf[:-1]
+                raw_buf = raw_buf[-1:]
+            else:
+                instr_raw = raw_buf
+                raw_buf = []
+        else:
+            instr_raw = []
+
+        prev_snap = state.snapshot_key()
+        state.execute(instr)
+        instr_count += 1
+
+        state_key = state.snapshot_key()
+        loop_action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
+        reg_changes = state.format_changed(prev_snap)
+
+        if watching:
+            show = watch_prev if cycle_type == CYCLE_OPCODE_FETCH else watch_cur
+        else:
+            show = True
+
+        lines = list(int_lines)
+        if trace_filter:
+            result = trace_filter.evaluate(instr, reg_changes, loop_action)
+            if show and result.lines:
+                lines.extend(instr_raw)
+                lines.extend(result.lines)
+        elif show:
+            if loop_action == "normal":
+                lines.extend(instr_raw)
+                lines.append(format_instruction(instr, reg_changes))
+            elif loop_action == "loop_exit":
+                summary = loop_det.loop_summary()
+                if summary:
+                    lines.append(summary)
+                lines.extend(instr_raw)
+                lines.append(format_instruction(instr, reg_changes))
+
+        if lines:
+            output.append({
+                'instr_idx': instr_count - 1,
+                'record_end': record_idx,
+                'lines': lines,
+            })
+
+    # Flush partial instruction
+    instr = assembler.flush()
+    if instr:
+        prev_snap = state.snapshot_key()
+        state.execute(instr)
+        instr_count += 1
+        state_key = state.snapshot_key()
+        action = loop_det.check(instr.pc, state_key) if detect_loops else "normal"
+        reg_changes = state.format_changed(prev_snap)
+        lines = list(raw_buf)
+        if action != "suppress":
+            if action == "loop_exit":
+                summary = loop_det.loop_summary()
+                if summary:
+                    lines.append(summary)
+            lines.append(format_instruction(instr, reg_changes))
+        if lines:
+            output.append({
+                'instr_idx': instr_count - 1,
+                'record_end': record_idx,
+                'lines': lines,
+            })
+
+    if loop_det.in_loop:
+        summary = loop_det.loop_summary()
+        if summary:
+            output.append({
+                'instr_idx': instr_count - 1,
+                'record_end': record_idx,
+                'lines': [summary],
+            })
+
+    print(f"\n--- {instr_count} instructions, {record_idx} records decoded ---",
+          file=sys.stderr)
+    print(state.format_registers(), file=sys.stderr)
+
+    return output
+
+
+# -- Main trace loop (for replay files and streaming) --
 
 def run_trace(source: BinaryIO, raw_output=False, is_file=False,
               detect_loops=True, filter_config=None,
@@ -650,12 +831,22 @@ def main():
     parser.add_argument(
         "--trigger-int", action="store_true",
         help="Trigger on interrupt (unexpected PC jump to RST vector)")
+    # Trigger window control (validated manually for mutual exclusion)
     parser.add_argument(
-        "--window", type=int, default=0, metavar="N",
-        help="Show N instructions before trigger event")
+        "--window", type=int, default=None, metavar="N",
+        help="Show N instructions before and after trigger")
     parser.add_argument(
-        "--max-frames", type=int, default=None, metavar="N",
-        help="Stop after processing N bus cycle frames (regardless of filtering)")
+        "--pre", type=int, default=None, metavar="N",
+        help="Show N instructions before trigger")
+    parser.add_argument(
+        "--post", type=int, default=None, metavar="N",
+        help="Show N instructions after trigger")
+    parser.add_argument(
+        "--pre-all", action="store_true",
+        help="Use all PSRAM for pre-trigger (half if --post-all also set)")
+    parser.add_argument(
+        "--post-all", action="store_true",
+        help="Use all PSRAM for post-trigger (half if --pre-all also set)")
     parser.add_argument(
         "--max-instructions", type=int, default=None, metavar="N",
         help="Stop after processing N instructions (regardless of filtering)")
@@ -667,6 +858,19 @@ def main():
         help="Memory report format (default: text)")
 
     args = parser.parse_args()
+
+    # Validate mutually exclusive window/pre/post options
+    has_window = args.window is not None
+    has_pre_post = args.pre is not None or args.post is not None
+    has_all = args.pre_all or args.post_all
+    if has_window and (has_pre_post or has_all):
+        parser.error("--window cannot be combined with --pre/--post/--pre-all/--post-all")
+    if has_pre_post and has_all:
+        parser.error("--pre/--post cannot be combined with --pre-all/--post-all")
+    if args.pre_all and args.pre is not None:
+        parser.error("--pre-all cannot be combined with --pre")
+    if args.post_all and args.post is not None:
+        parser.error("--post-all cannot be combined with --post")
 
     # Build filter config from args
     fcfg = FilterConfig(
@@ -681,7 +885,7 @@ def main():
         io_read_triggers=[parse_trigger_addr(t) for t in args.trigger_io_read],
         io_write_triggers=[parse_trigger_addr(t) for t in args.trigger_io_write],
         trigger_int=args.trigger_int,
-        window_size=args.window,
+        window_size=args.window or 0,
     )
 
     mem_tracer = MemoryTracer() if args.memory_report else None
@@ -691,7 +895,6 @@ def main():
         with open(args.replay, "rb") as f:
             run_trace(f, raw_output=args.raw, is_file=True,
                       detect_loops=args.loops, filter_config=fcfg,
-                      max_frames=args.max_frames,
                       max_instructions=args.max_instructions,
                       memory_tracer=mem_tracer,
                       show_interrupts=not args.no_interrupts,
@@ -709,7 +912,10 @@ def main():
         print("pyserial is required: pip install pyserial", file=sys.stderr)
         sys.exit(1)
 
-    ser = serial.Serial(args.port, args.baud, timeout=0.1)
+    from . import capture
+
+    ser = serial.Serial(args.port, args.baud, timeout=0.5)
+    ser.reset_input_buffer()
 
     if args.hexdump:
         print(f"Hex dump from {args.port} -- Ctrl+C to stop")
@@ -730,23 +936,210 @@ def main():
             ser.close()
         return
 
-    # Live capture: use capture.py's PSRAM protocol for real hardware.
-    # For now, support direct record streaming for testing.
-    print(f"Connected to {args.port}")
-    ser.reset_input_buffer()
-    print("Tracing -- Ctrl+C to stop")
+    # -- Live capture via PSRAM command protocol --
 
-    run_trace(ser, raw_output=args.raw, detect_loops=args.loops,
-              filter_config=fcfg,
-              max_frames=args.max_frames,
-              max_instructions=args.max_instructions,
-              memory_tracer=mem_tracer,
-              show_interrupts=not args.no_interrupts,
-              watch_ranges=watch)
+    status = capture.get_status(ser)
+    print(f"Connected to {args.port} "
+          f"(CPU: {status['cpu_clock_khz']/1000:.0f} MHz, "
+          f"state: {status['capture_state_name']})")
+
+    # Configure triggers from CLI args
+    capture.clear_triggers(ser)
+    has_trigger = False
+
+    for spec in args.trigger_mem_read:
+        addr_val = _parse_trigger_spec(spec)
+        capture.set_trigger(ser, capture.TRIG_MEM_READ, **addr_val)
+        print(f"Trigger: memory read at 0x{addr_val['addr_lo']:04X}")
+        has_trigger = True
+    for spec in args.trigger_mem_write:
+        addr_val = _parse_trigger_spec(spec)
+        capture.set_trigger(ser, capture.TRIG_MEM_WRITE, **addr_val)
+        print(f"Trigger: memory write at 0x{addr_val['addr_lo']:04X}")
+        has_trigger = True
+    for spec in args.trigger_io_read:
+        addr_val = _parse_trigger_spec(spec)
+        capture.set_trigger(ser, capture.TRIG_IO_READ, **addr_val)
+        print(f"Trigger: I/O read at 0x{addr_val['addr_lo']:04X}")
+        has_trigger = True
+    for spec in args.trigger_io_write:
+        addr_val = _parse_trigger_spec(spec)
+        capture.set_trigger(ser, capture.TRIG_IO_WRITE, **addr_val)
+        print(f"Trigger: I/O write at 0x{addr_val['addr_lo']:04X}")
+        has_trigger = True
+    if args.trigger_int:
+        capture.set_trigger(ser, capture.TRIG_INT_ACK, 0x0000, 0xFFFF)
+        print("Trigger: interrupt acknowledge")
+        has_trigger = True
+
+    # Start-at addresses become PC triggers
+    for start_spec in fcfg.start_at:
+        if isinstance(start_spec, tuple):
+            lo, hi = start_spec
+        else:
+            lo = hi = start_spec
+        capture.set_trigger(ser, capture.TRIG_PC_MATCH, lo, hi)
+        print(f"Trigger: PC at 0x{lo:04X}" + (f"-0x{hi:04X}" if hi != lo else ""))
+        has_trigger = True
+
+    # Determine instruction counts and record estimates.
+    # Records-per-instruction varies (1 for NOP, up to ~8 for complex IX ops).
+    # Use 10x overestimate to ensure we fetch enough records from PSRAM.
+    PSRAM_MAX = 2 * 1024 * 1024  # PSRAM_RING_RECORDS
+    RECORDS_PER_INSTR = 10       # conservative overestimate
+
+    # Resolve --window / --pre / --post / --*-all into instruction counts.
+    # Default (nothing specified): 100 pre + 100 post.
+    # If only one side is given, the other defaults to 0.
+    if args.window is not None:
+        pre_instrs = args.window
+        post_instrs = args.window
+    elif args.pre_all or args.post_all:
+        pre_instrs = None if args.pre_all else 0
+        post_instrs = None if args.post_all else 0
+    elif args.pre is not None or args.post is not None:
+        pre_instrs = args.pre if args.pre is not None else 0
+        post_instrs = args.post if args.post is not None else 0
+    else:
+        pre_instrs = 100
+        post_instrs = 100
+
+    # Convert instruction counts to record counts for firmware.
+    # --pre-all / --post-all: use full PSRAM if alone, half if both set.
+    if pre_instrs is None and post_instrs is None:
+        # Both "all" — split evenly
+        pre_records = PSRAM_MAX // 2
+        post_records = PSRAM_MAX // 2
+    elif pre_instrs is None:
+        # --pre-all only — post gets what it needs, pre gets the rest
+        post_records = min(post_instrs * RECORDS_PER_INSTR, PSRAM_MAX)
+        pre_records = PSRAM_MAX
+    elif post_instrs is None:
+        # --post-all only — pre gets what it needs, post gets the rest
+        pre_records = min(pre_instrs * RECORDS_PER_INSTR, PSRAM_MAX)
+        post_records = PSRAM_MAX
+    else:
+        pre_records = min(pre_instrs * RECORDS_PER_INSTR, PSRAM_MAX)
+        post_records = min(post_instrs * RECORDS_PER_INSTR, PSRAM_MAX)
+
+    if has_trigger:
+        pre_label = 'all' if pre_instrs is None else str(pre_instrs)
+        post_label = 'all' if post_instrs is None else str(post_instrs)
+        print(f"Arming trigger (pre={pre_label}, post={post_label} instructions)...")
+        capture.arm_trigger(ser, post_records)
+
+        print("Waiting for trigger...", end='', flush=True)
+        try:
+            while True:
+                time.sleep(0.1)
+                st = capture.get_status(ser)
+                if st['capture_state'] == capture.CAP_DONE:
+                    print(f" triggered! (write_idx={st['write_idx']})")
+                    break
+                if st['capture_state'] == capture.CAP_TRIGGERED:
+                    print(".", end='', flush=True)
+                    continue
+        except KeyboardInterrupt:
+            print(" interrupted")
+            capture.stop_capture(ser)
+    else:
+        # No triggers — just capture until Ctrl+C, then download
+        print("Capturing (Ctrl+C to stop)...")
+        capture.start_capture(ser)
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+        print()
+
+    # Download records from PSRAM
+    records, trig_off = capture.read_buffer(
+        ser, pre_count=pre_records, post_count=post_records)
+    capture.stop_capture(ser)
+
+    # Print diagnostics
+    st = capture.get_status(ser)
+    if st['dma_overflows']:
+        print(f"WARNING: {st['dma_overflows']} DMA overflows (data lost)",
+              file=sys.stderr)
+    if st['wait_asserts']:
+        print(f"Note: {st['wait_asserts']} /WAIT assertions (Z80 was paused)",
+              file=sys.stderr)
+
+    # Build a live-mode filter config: start_at and client-side triggers
+    # are handled by firmware triggers, so exclude them to avoid
+    # double-filtering.  Keep --mask, --stop-at, --stop-on, --limit.
+    live_fcfg = FilterConfig(
+        address_masks=[parse_address_range(m) for m in args.mask],
+        start_at=[],
+        stop_at=args.stop_at,
+        start_on=None,
+        stop_on=args.stop_on,
+        limit=args.limit,
+        mem_read_triggers=[],
+        mem_write_triggers=[],
+        io_read_triggers=[],
+        io_write_triggers=[],
+        trigger_int=False,
+        window_size=0,
+    )
+
+    # Decode all records through the analysis pipeline, then trim by
+    # instruction count around the trigger point.
+    raw_bytes = b''.join(struct.pack('<HBB', *rec) for rec in records)
+    all_output = _decode_to_lines(
+        raw_bytes, raw_output=args.raw,
+        detect_loops=args.loops, filter_config=live_fcfg,
+        memory_tracer=mem_tracer,
+        show_interrupts=not args.no_interrupts,
+        watch_ranges=watch)
+
+    # Find the trigger position in the output list.  trig_off is the
+    # record index within the downloaded buffer; find the output entry
+    # whose records span that index.
+    if trig_off is not None and all_output:
+        trig_pos = len(all_output) - 1  # default: last entry
+        for i, entry in enumerate(all_output):
+            if entry['record_end'] > trig_off:
+                trig_pos = i
+                break
+        # Trim around trigger by output position (not instruction number)
+        if pre_instrs is not None:
+            start = max(0, trig_pos - pre_instrs)
+        else:
+            start = 0
+        if post_instrs is not None:
+            end = min(len(all_output), trig_pos + post_instrs + 1)
+        else:
+            end = len(all_output)
+        trimmed = all_output[start:end]
+    else:
+        # No trigger or no output — show everything (trimmed by pre/post)
+        if pre_instrs is not None and not has_trigger:
+            trimmed = all_output[-pre_instrs:] if all_output else []
+        else:
+            trimmed = all_output
+
+    for entry in trimmed:
+        for line in entry['lines']:
+            print(line)
 
     if mem_tracer:
         mem_tracer.report(fmt=args.memory_report_format)
     ser.close()
+
+
+def _parse_trigger_spec(spec):
+    """Parse 'ADDR' or 'ADDR=VAL' trigger spec into capture.set_trigger kwargs."""
+    if '=' in spec:
+        addr_s, val_s = spec.split('=', 1)
+        addr = int(addr_s, 0)
+        val = int(val_s, 0)
+        return {'addr_lo': addr, 'data_val': val, 'data_mask': 0xFF}
+    else:
+        addr = int(spec, 0)
+        return {'addr_lo': addr}
 
 
 if __name__ == "__main__":
