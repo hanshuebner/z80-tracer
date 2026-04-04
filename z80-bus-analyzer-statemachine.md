@@ -9,7 +9,7 @@
 | Signal    | Dir | Active | Sampling Notes                                |
 |-----------|-----|--------|-----------------------------------------------|
 | CLK       | in  | —      | State transitions keyed to CLK rising edges   |
-| A15–A0    | out | High   | Active during T1                              |
+| A15–A0    | out | High   | Active during T2                              |
 | D7–D0     | bi  | High   | Sampled at specific points per cycle type     |
 | /M1       | out | Low    | Identifies opcode fetch or interrupt ack      |
 | /MREQ     | out | Low    | Memory access (fetch, read, write)            |
@@ -18,8 +18,6 @@
 | /WR       | out | Low    | CPU data bus holds valid write data           |
 | /HALT     | out | Low    | CPU is in HALT state (executing NOPs)         |
 | /WAIT     | in  | Low    | Peripheral requests wait states               |
-| /BUSREQ   | in  | Low    | External device requests bus                  |
-| /BUSACK   | out | Low    | CPU has released bus                          |
 | /INT      | in  | Low    | Maskable interrupt request                    |
 | /NMI      | in  | Low    | Nonmaskable interrupt (edge-triggered)        |
 | /RESET    | in  | Low    | System reset                                  |
@@ -87,10 +85,10 @@ exact cycle type.
 
 For **M1 cycles** (/M1 low):
 
-| /MREQ at T2↑ | Cycle Type                    | Rationale                         |
-|--------------|-------------------------------|-----------------------------------|
-| Low          | **OPCODE FETCH**              | /MREQ went low at T1↓, still low |
-| High         | **INTERRUPT ACKNOWLEDGE**     | /MREQ never asserts; /IORQ later |
+| /MREQ at T2↑ | Cycle Type                    |
+|--------------|-------------------------------|
+| Low          | **OPCODE FETCH**              |
+| High         | **INTERRUPT ACKNOWLEDGE**     |
 
 For **non-M1 cycles** (/M1 high):
 
@@ -105,7 +103,6 @@ For **non-M1 cycles** (/M1 high):
 
 | Condition                  | State                | Ref       |
 |----------------------------|----------------------|-----------|
-| /BUSACK low                | **BUS RELEASED**     | Fig. 8    |
 | /HALT low + M1 cycling     | **HALT** (NOP fetch) | Fig. 11   |
 | /RESET low                 | **RESET**            | p. 6      |
 
@@ -140,21 +137,20 @@ Entry: /M1 low at T2↑, /MREQ low at T2↑ (confirms fetch, not INT ACK)
          │  /MREQ ↑, /RD ↑                                  │
          │                                                  │
   T4 ↑   │  /M1 ↑                                           │
-         │  ► SAMPLE /BUSREQ (for possible bus release)     │
          │  ► SAMPLE /INT, /NMI (at end of last M cycle     │
          │    of instruction only — tracked by decoder)     │
          │  → Next cycle's T1 follows at next CLK ↑         │
          └──────────────────────────────────────────────────┘
 
 Capture record:
-  { type: M1_FETCH, addr: A[15:0]@T1↑, data: D[7:0]@T3↑,
+  { type: M1_FETCH, addr: A[15:0]@T2↑, data: D[7:0]@T3↑,
     waits: count_of_TW, halt: /HALT level }
 ```
 
 ### 4.2 MEMORY READ — Ref: Figure 6 (left half)
 
 ```
-Entry: /M1 high at T1↑, /MREQ low + /RD low at T2↑
+Entry: /M1 high, /MREQ low + /RD low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              Memory Read Cycle                   │
@@ -175,14 +171,14 @@ Entry: /M1 high at T1↑, /MREQ low + /RD low at T2↑
          └──────────────────────────────────────────────────┘
 
 Capture record:
-  { type: MEM_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↑,
+  { type: MEM_RD, addr: A[15:0]@T2↑, data: D[7:0]@T3↑,
     waits: count_of_TW }
 ```
 
 ### 4.3 MEMORY WRITE — Ref: Figure 6 (right half)
 
 ```
-Entry: /M1 high at T1↑, /MREQ low + /WR low at T2↑
+Entry: /M1 high, /MREQ low + /WR low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              Memory Write Cycle                  │
@@ -206,14 +202,14 @@ Note: /WR goes inactive at T3↑, half a T-state before address
 and data change. This satisfies hold time for memory.
 
 Capture record:
-  { type: MEM_WR, addr: A[15:0]@T1↑, data: D[7:0]@T2↑,
+  { type: MEM_WR, addr: A[15:0]@T2↑, data: D[7:0]@T2↑,
     waits: count_of_TW }
 ```
 
 ### 4.4 I/O READ — Ref: Figure 7 (upper half)
 
 ```
-Entry: /M1 high at T1↑, /IORQ low + /RD low at T2↑
+Entry: /M1 high, /IORQ low + /RD low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              I/O Read Cycle                      │
@@ -249,14 +245,14 @@ from /IORQ going active to the WAIT sample point is too short
 for I/O devices to decode their address and assert /WAIT.
 
 Capture record:
-  { type: IO_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↑,
+  { type: IO_RD, addr: A[15:0]@T2↑, data: D[7:0]@T3↑,
     waits: 1 + count_of_additional_TW }
 ```
 
 ### 4.5 I/O WRITE — Ref: Figure 7 (lower half)
 
 ```
-Entry: /M1 high at T1↑, /IORQ low + /WR low at T2↑
+Entry: /M1 high, /IORQ low + /WR low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              I/O Write Cycle                     │
@@ -280,14 +276,14 @@ Entry: /M1 high at T1↑, /IORQ low + /WR low at T2↑
          └──────────────────────────────────────────────────┘
 
 Capture record:
-  { type: IO_WR, addr: A[15:0]@T1↑, data: D[7:0]@T2↑,
+  { type: IO_WR, addr: A[15:0]@T2↑, data: D[7:0]@T2↑,
     waits: 1 + count_of_additional_TW }
 ```
 
 ### 4.6 INTERRUPT ACKNOWLEDGE — Ref: Figure 9
 
 ```
-Entry: /M1 low at T1↑, /MREQ HIGH at T2↑ (distinguishes from fetch)
+Entry: /M1 low, /MREQ HIGH at T2↑ (distinguishes from fetch)
 
          ┌──────────────────────────────────────────────────┐
          │          Interrupt Acknowledge Cycle             │
@@ -320,48 +316,10 @@ The interrupt vector on D[7:0] depends on the interrupt mode:
   Mode 2: low byte of vector table pointer (high byte = I register)
 
 Capture record:
-  { type: INT_ACK, addr: A[15:0]@T1↑, data: D[7:0]@T3↑,
+  { type: INT_ACK, addr: A[15:0]@T2↑, data: D[7:0]@T3↑,
     waits: 2 + count_of_additional_TW }
 ```
 
-### 4.7 BUS REQUEST / ACKNOWLEDGE — Ref: Figure 8
-
-```
-This is not a machine cycle — it's a bus ownership transfer.
-
-         ┌──────────────────────────────────────────────────┐
-         │          Bus Request / Release                   │
-         │                                                  │
-  Any    │  /BUSREQ is sampled at rising edge of the LAST   │
-  M-cycle│  T-state of any machine cycle.                   │
-  last T │                                                  │
-    ↑    │  if /BUSREQ=low:                                 │
-         │    Next CLK ↑:                                   │
-         │      Address bus → Hi-Z                          │
-         │      Data bus → Hi-Z                             │
-         │      /MREQ, /IORQ, /RD, /WR → Hi-Z               │
-         │      /BUSACK ↓                                   │
-         │                                                  │
-  Tx ↑   │  ► Detect: /BUSACK=low                           │
-  (each) │  Bus is floating — external controller active    │
-         │  ► SAMPLE /BUSREQ each rising edge               │
-         │  if /BUSREQ returns high:                        │
-         │    /BUSACK ↑                                     │
-         │    CPU resumes with T1 of next M cycle           │
-         └──────────────────────────────────────────────────┘
-
-Analyzer behavior:
-  While /BUSACK is low, the analyzer cannot capture meaningful
-  address/data (bus is Hi-Z or driven by DMA controller).
-  The analyzer should record DMA activity as:
-  { type: BUS_RELEASED, duration: count_of_Tx_clocks }
-
-  If the external DMA controller drives /MREQ, /RD, /WR, the
-  analyzer COULD optionally trace DMA transfers using the same
-  signal decoding, but must note they are not CPU-originated.
-
-NOTE: During bus request, /INT and /NMI are NOT serviced.
-```
 
 ### 4.8 NONMASKABLE INTERRUPT RESPONSE — Ref: Figure 10
 
@@ -436,10 +394,10 @@ Combining all cycle types, the top-level state machine is:
                │          └───┬────┘
                │   /RESET=high│
                │              ▼
-               │          ┌────────┐  /BUSREQ ack'd   ┌─────────────┐
-               │          │  IDLE  │─────────────────►│ BUS_RELEASED│
-               │          │(T1 ↑)  │◄─────────────────│  (DMA)      │
-               │          └───┬────┘  /BUSACK=high    └─────────────┘
+               │          ┌────────┐
+               │          │  IDLE  │
+               │          │(T1 ↑)  │
+               │          └───┬────┘
                │              │
                │              ▼
                │          ┌────────┐
@@ -487,17 +445,16 @@ struct TraceRecord {
     cycle_type:   enum { M1_FETCH, MEM_RD, MEM_WR,
                          IO_RD, IO_WR, INT_ACK,
                          BUS_RELEASED, RESET },
-    address:      u16,          // A[15:0] captured at T1↑
+    wait_count:   u8:3,         // number of TW states inserted
+    halt:         u8:1,         // /HALT was active during this cycle
+    address:      u16,          // A[15:0] captured at T2↑
     data:         u8,           // D[7:0] — sample point depends on cycle:
-                                 //   M1_FETCH: T3↑
-                                 //   MEM_RD:   T3↑
-                                 //   MEM_WR:   T2↑
-                                 //   IO_RD:    T3↑
-                                 //   IO_WR:    T2↑
-                                 //   INT_ACK:  T3↑
-    wait_count:   u8,           // number of TW states inserted
-    halt:         bool,         // /HALT was active during this cycle
-    clk_count:    u32,          // absolute CLK count for timestamp
+                                //   M1_FETCH: T3↑
+                                //   MEM_RD:   T3↑
+                                //   MEM_WR:   T2↑
+                                //   IO_RD:    T3↑
+                                //   IO_WR:    T2↑
+                                //   INT_ACK:  T3↑
 }
 ```
 
@@ -511,7 +468,6 @@ The analyzer makes all cycle-type decisions at rising CLK edges:
 CLK ↑ (T1)
   │
   ├─ /RESET = low? ─────────────── YES → RESET state
-  ├─ /BUSACK = low? ────────────── YES → BUS_RELEASED
   │
   ▼
 CLK ↑ (T2)  ← all control signals have settled
