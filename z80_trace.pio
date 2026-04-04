@@ -1,7 +1,11 @@
 ; Z80 Bus Analyzer - PIO program for PGA2350
 ;
-; Samples all bus signals at BOTH Z80 CLK edges (rising and falling).
-; The ARM core runs the full cycle-level state machine.
+; Samples all bus signals at Z80 CLK **rising edges only**.
+; Falling-edge data (/WAIT, read data, refresh address) is captured
+; by the ARM core via inline GPIO polling between rising edges.
+;
+; This halves PIO/DMA throughput vs dual-edge sampling, doubling the
+; ARM processing budget per sample (~70 ARM cycles at 300 MHz / 4 MHz Z80).
 ;
 ; Pin mapping (configured via C SDK):
 ;   in_base = GPIO 0 (captures GPIO 0-31: addr + data + control + halt)
@@ -16,17 +20,16 @@
 ;   [27]    = /RD
 ;   [28]    = /WR
 ;   [29]    = /RFSH
-;   [30]    = CLK  (1 = rising edge sample, 0 = falling edge sample)
+;   [30]    = CLK  (always 1 — captured at rising edge)
 ;   [31]    = /HALT
 ;
 ; Autopush at 32 bits — no manual push needed.
-; Two samples per Z80 clock period.
+; One sample per Z80 clock period (rising edge only).
 
 .program z80_bus_sample
 
 .wrap_target
+    wait 0 gpio 30          ; ensure CLK is low (edge detection guard)
     wait 1 gpio 30          ; wait for CLK rising edge
-    in pins, 32             ; capture GPIO 0-31 (CLK=1 → rising edge)
-    wait 0 gpio 30          ; wait for CLK falling edge
-    in pins, 32             ; capture GPIO 0-31 (CLK=0 → falling edge)
+    in pins, 32             ; capture GPIO 0-31
 .wrap

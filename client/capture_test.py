@@ -31,13 +31,36 @@ def run_diag_mode(ser, mode, name, duration, cpu_mhz):
     cycles_per_sample = (cpu_mhz * 1e6) / samples_sec if samples_sec > 0 else float('inf')
 
     print(f"\n  [{name}]")
-    print(f"    samples/sec:      {samples_sec:,.0f}  ({cycles_per_sample:.1f} cycles/sample at {cpu_mhz}MHz)")
+    print(f"    samples/sec:      {samples_sec:,.0f}  "
+          f"({cycles_per_sample:.1f} avg cycles/sample at {cpu_mhz:.0f} MHz)")
     print(f"    records/sec:      {records_sec:,.0f}")
-    print(f"    dma_overflows:    {status['dma_overflows']}")
-    print(f"    max_dma_distance: {status['max_dma_distance']}/{8192} "
-          f"({status['max_dma_distance']*100/8192:.0f}%)")
-    print(f"    max_stage_depth:  {status['max_stage_depth']}")
-    print(f"    wait_asserts:     {status['wait_asserts']}")
+    print(f"    DMA backlog:      {status['max_dma_distance']}/{capture.CAPTURE_BUF_WORDS} "
+          f"({status['max_dma_distance']*100/capture.CAPTURE_BUF_WORDS:.0f}%)")
+    print(f"    stage depth:      {status['max_stage_depth']}")
+    print(f"    /WAIT asserts:    {status['wait_asserts']}")
+
+    # Performance measurement (DWT cycle counter)
+    max_c = status['sample_max_cycles']
+    min_c = status['sample_min_cycles']
+    if min_c is not None:
+        budget = int(cpu_mhz * 1e6 / 4e6)  # cycles per sample at 4 MHz Z80
+        ok = "OK" if max_c <= budget else "*** OVER BUDGET ***"
+        print(f"    cycles/sample:    {min_c}–{max_c} (budget: {budget}) {ok}")
+    else:
+        print(f"    cycles/sample:    (no samples processed)")
+
+    # Data loss
+    loss_total = (status['dma_overflows'] + status['pio_overflows']
+                  + status['staging_overflows'] + status['poll_timeouts'])
+    if loss_total > 0:
+        print(f"    *** DATA LOSS ***")
+        print(f"      DMA overflows:     {status['dma_overflows']}")
+        print(f"      PIO overflows:     {status['pio_overflows']}")
+        print(f"      staging overflows: {status['staging_overflows']}")
+        print(f"      poll timeouts:     {status['poll_timeouts']}")
+        print(f"      loss records:      {status['data_loss_records']}")
+    else:
+        print(f"    data loss:        none")
 
     time.sleep(0.1)
     return status
@@ -47,11 +70,12 @@ def run_diagnostics(ser, duration):
     """Run all diagnostic modes to isolate the bottleneck."""
     status = capture.get_status(ser)
     cpu_mhz = status['cpu_clock_khz'] / 1000
-    budget = cpu_mhz * 1e6 / 8e6
+    budget = int(cpu_mhz * 1e6 / 4e6)
 
     print(f"=== Performance Diagnostics ({duration}s each) ===")
-    print(f"    CPU clock: {cpu_mhz:.0f} MHz")
-    print(f"    Expected: 8M samples/sec at 4MHz Z80 → {budget:.1f} cycles/sample budget")
+    print(f"    CPU clock:      {cpu_mhz:.0f} MHz")
+    print(f"    Rising-edge-only: 4M samples/sec at 4 MHz Z80")
+    print(f"    Budget:         {budget} cycles/sample")
 
     run_diag_mode(ser, capture.DIAG_SKIP_BOTH,
                   "Mode 3: Skip all (DMA read baseline)", duration, cpu_mhz)
@@ -156,9 +180,7 @@ def main():
         run_diagnostics(ser, args.capture_time)
     else:
         status = capture.get_status(ser)
-        print(f"State: {status['capture_state_name']}, "
-              f"triggers: {status['trigger_count']}, "
-              f"CPU: {status['cpu_clock_khz']/1000:.0f} MHz")
+        print(capture.format_status(status))
         run_trigger_test(ser, args)
 
     ser.close()

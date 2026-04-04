@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Z80 bus tracer using a Pimoroni PGA2350 (RP2350). The firmware captures all Z80 bus activity in real time using a PIO sampler and a dedicated ARM core (core 1) running a full T-state-level bus analyzer state machine. Trace records are streamed over USB CDC. A Python host client decodes them into a Z80 instruction trace with register state tracking and loop detection. **Not yet tested on real hardware.**
+Z80 bus tracer using a Pimoroni PGA2350 (RP2350). The firmware captures all Z80 bus activity in real time using a PIO sampler (rising CLK edges only) and a dedicated ARM core (core 1) running a full T-state-level bus analyzer state machine. Falling-edge data (wait states, read data, refresh address) is captured via GPIO polling or secondary PIO on demand. Trace records are buffered into PSRAM during capture, then transferred to host over USB. Trigger conditions (address/data match, start/stop) are evaluated in firmware. A Python host client handles post-capture visualization and analysis. **Not yet tested on real hardware.**
 
 ## Build Commands
 
@@ -33,11 +33,12 @@ Single test file with smoke tests against synthetic data. Run from repo root.
 ## Architecture
 
 ### Firmware (`main.c`, `z80_trace.h`, `z80_trace.pio`)
-- Single PIO state machine samples GPIO 0-31 at every CLK edge (both rising and falling), using autopush at 32 bits. CLK bit (30) distinguishes edges.
+- Primary PIO state machine samples GPIO 0-31 at every CLK **rising edge** only, using autopush at 32 bits. Falling-edge data captured via GPIO poll or secondary PIO on demand.
 - DMA ring buffer (32KB) drains PIO FIFO continuously
-- Core 1 (dedicated): runs the full Z80 bus analyzer state machine, tracking T-states and cycle types per `z80-bus-analyzer-statemachine.md`. Produces `trace_record_t` structs into an inter-core queue.
-- Core 0: services USB CDC, drains trace queue, encodes 6-byte packets
-- Flow control: asserts /WAIT when trace queue is 75% full, releases at 25%
+- Core 1 (dedicated): runs the full Z80 bus analyzer state machine, tracking T-states and cycle types per `z80-bus-analyzer-statemachine.md`. Writes trace records to PSRAM ring buffer. Budget: ~70 ARM cycles per rising edge.
+- Core 0: services USB CDC, handles host commands (start/stop capture, configure triggers, download trace from PSRAM)
+- Trigger system: firmware-resident address/data/cycle-type match conditions, evaluated inline by core 1 state machine
+- PSRAM ring buffer (8 MB): stores trace records during capture; transferred to host after capture stops
 - Mid-stream sync: on startup or after reset, the analyzer enters sync mode and only locks onto unambiguous M1 cycles (/M1 low at T1↑). Internal operation T-states are handled by re-interpreting rising edges.
 - Supported cycle types: M1 opcode fetch, memory read/write, I/O read/write (with auto-wait), interrupt acknowledge (with 2 auto-waits), reset detection
 

@@ -8,7 +8,7 @@
 
 | Signal    | Dir | Active | Sampling Notes                                |
 |-----------|-----|--------|-----------------------------------------------|
-| CLK       | in  | —      | All state transitions keyed to CLK edges      |
+| CLK       | in  | —      | State transitions keyed to CLK rising edges   |
 | A15–A0    | out | High   | Active during T1; refresh addr during M1 T3–T4 |
 | D7–D0     | bi  | High   | Sampled at specific points per cycle type     |
 | /M1       | out | Low    | Identifies opcode fetch or interrupt ack      |
@@ -34,17 +34,60 @@ The analyzer tracks two levels of state:
 - **Cycle type**: Which kind of machine cycle is in progress
 - **T-state**: Which clock period within that cycle
 
-Every transition is triggered by a **CLK edge** (rising ↑ or falling ↓).
-Signal levels are sampled at the indicated edge to determine the next state.
+### Rising-Edge-Only Architecture
+
+All state transitions are driven by **CLK rising edges only**, sampled by the
+PIO state machine. This halves the PIO/DMA throughput compared to dual-edge
+sampling, which is critical for meeting the 4 MHz Z80 performance target.
+
+The tracer is a **passive observer** — it does not control /WAIT or any other
+Z80 bus signal. It must keep up with the Z80 at full speed (up to 4 MHz)
+without ever falling behind. The total budget per rising edge is approximately
+**70 ARM cycles** (at 300 MHz ARM, with a 250 ns Z80 T-state).
+
+A small number of operations require data that becomes valid on the **falling
+edge** of CLK:
+- /WAIT sampling (at T2↓ and TW↓) — **always required**, wait states are used
+- Data bus capture for read cycles (MEM_RD, IO_RD, INT_ACK at T3↓)
+- Refresh address capture (M1 at T3↓)
+
+These are handled by **GPIO polling** (busy-wait for CLK to go low, then
+read the bus via GPIO) or by a **secondary PIO state machine** dedicated to
+falling-edge capture. The secondary PIO is triggered on demand by the ARM
+core only when a falling-edge sample is actually needed — most T-states do
+not need one.
+
+### Data flow: PSRAM buffering, not USB streaming
+
+Trace records are written to the PGA2350's **PSRAM ring buffer** during
+capture, not streamed over USB. USB bandwidth is insufficient for sustained
+4 MHz capture. The host client connects after capture to download the trace
+buffer for visualization and analysis.
+
+### Triggers are firmware-resident
+
+Trigger conditions (start/stop capture, address match, data match, etc.)
+are evaluated **in the tracer firmware**, not by the host client. The client
+is used only for post-capture visualization and analysis. This eliminates
+USB round-trip latency from the trigger path.
+
+### Cycle type discrimination at T2↑ (not T1↓)
+
+In the original Z80 timing, cycle type identification partially depends on
+signals that change at T1↓ (/MREQ for memory cycles). However, these signals
+remain asserted through T2↑, so the analyzer defers cycle type discrimination
+to T2↑ where all relevant signals (/MREQ, /IORQ, /RD, /WR) have settled.
+This eliminates the need to process T1 falling edges.
 
 ---
 
 ## 3. Cycle Type Identification
 
-At the **start of T1** (rising edge of CLK entering T1), the analyzer must determine
-what cycle type is beginning. The discrimination depends partly on what happens
-*during* the cycle (e.g., /MREQ vs /IORQ going low), so the analyzer uses a
-two-phase identification:
+At the **start of T1** (rising edge of CLK entering T1), the analyzer captures
+the address bus and checks /M1 to determine the cycle class.
+
+At **T2↑**, all control signals have settled, and the analyzer determines the
+exact cycle type.
 
 ### Phase 1 — T1 rising edge: Check /M1
 
@@ -53,30 +96,28 @@ two-phase identification:
 | Low         | This is an M1 cycle (opcode fetch or INT ack)   |
 | High        | Non-M1 cycle (mem r/w, I/O r/w)                 |
 
-### Phase 2 — T1 falling edge (or T2 rising): Refine cycle type
+### Phase 2 — T2 rising edge: Determine exact cycle type
 
-For **M1 cycles** (/M1 low):
+For **M1 cycles** (/M1 low at T1↑):
 
-| /MREQ at T1↓ | /IORQ    | Cycle Type                    | Ref       |
-|--------------|----------|-------------------------------|-----------|
-| Low          | High     | **OPCODE FETCH**              | Fig. 5    |
-| High         | (later)  | **INTERRUPT ACKNOWLEDGE**     | Fig. 9    |
+| /MREQ at T2↑ | Cycle Type                    | Rationale                         |
+|--------------|-------------------------------|-----------------------------------|
+| Low          | **OPCODE FETCH**              | /MREQ went low at T1↓, still low |
+| High         | **INTERRUPT ACKNOWLEDGE**     | /MREQ never asserts; /IORQ later |
 
-Note: In INT ACK, /IORQ goes low at T2↓ (not T1↓), and /MREQ stays high.
+For **non-M1 cycles** (/M1 high at T1↑):
 
-For **non-M1 cycles** (/M1 high), determined at T1↓ / T2↑:
+| /MREQ | /IORQ | /RD  | /WR  | Cycle Type          | Rationale                     |
+|--------|-------|------|------|---------------------|-------------------------------|
+| Low    | High  | Low  | High | **MEMORY READ**     | /MREQ, /RD went low at T1↓   |
+| Low    | High  | High | Low  | **MEMORY WRITE**    | /MREQ at T1↓, /WR at T2↑     |
+| High   | Low   | Low  | High | **I/O READ**        | /IORQ, /RD go low at T2↑     |
+| High   | Low   | High | Low  | **I/O WRITE**       | /IORQ, /WR go low at T2↑     |
 
-| /MREQ  | /IORQ | /RD  | /WR  | Cycle Type          | Ref       |
-|--------|-------|------|------|---------------------|-----------|
-| Low    | High  | Low  | High | **MEMORY READ**     | Fig. 6    |
-| Low    | High  | High | Low  | **MEMORY WRITE**    | Fig. 6    |
-| High   | Low   | Low  | High | **I/O READ**        | Fig. 7    |
-| High   | Low   | High | Low  | **I/O WRITE**       | Fig. 7    |
+Note: For memory write, /WR goes active early in T2 (before T2↑ per manual
+Fig. 6), so it is visible at T2↑. For I/O, /IORQ goes active at T2↑ (Fig. 7).
 
-Note on I/O: /IORQ and /RD or /WR go active at T2↑ (not T1↓ like memory).
-The analyzer sees /MREQ staying high through T1↓ to distinguish I/O from memory.
-
-### Special states (detected by dedicated signals):
+### Special states (detected at any rising edge):
 
 | Condition                  | State                | Ref       |
 |----------------------------|----------------------|-----------|
@@ -88,13 +129,14 @@ The analyzer sees /MREQ staying high through T1↓ to distinguish I/O from memor
 
 ## 4. Cycle State Machines
 
-Each cycle type below is a sub-state-machine. Transitions are annotated with
-the CLK edge that triggers them. **Bold** items are analyzer capture actions.
+Each cycle type below is a sub-state-machine. All state transitions occur at
+**CLK rising edges**. Where falling-edge data is needed, the analyzer uses
+GPIO polling or a secondary PIO (marked with ⚡ below).
 
 ### 4.1 OPCODE FETCH (M1 cycle) — Ref: Figure 5
 
 ```
-Entry: /M1 goes low (observed at T1 rising edge)
+Entry: /M1 low at T1↑, /MREQ low at T2↑ (confirms fetch, not INT ACK)
 
          ┌──────────────────────────────────────────────────┐
          │                  M1 Cycle                        │
@@ -102,17 +144,13 @@ Entry: /M1 goes low (observed at T1 rising edge)
   T1 ↑   │  /M1=low, Address bus = PC                       │
          │  ► CAPTURE address (this is the PC)              │
          │                                                  │
-  T1 ↓   │  /MREQ ↓, /RD ↓                                  │
-         │  (confirms: opcode fetch, not INT ACK)           │
-         │                                                  │
-  T2 ↑   │  (memory responding)                             │
-         │                                                  │
-  T2 ↓   │  ► SAMPLE /WAIT                                  │
-         │  if /WAIT=low → insert TW, stay at T2↓ check     │
+  T2 ↑   │  /MREQ=low, /RD=low (confirms opcode fetch)     │
+         │  ⚡ POLL for T2↓: SAMPLE /WAIT                   │
+         │  if /WAIT=low → enter TW loop                    │
          │  if /WAIT=high → proceed to T3                   │
          │                                                  │
   TW ↑   │  (wait state — may repeat)                       │
-  TW ↓   │  ► SAMPLE /WAIT again                            │
+         │  ⚡ POLL for TW↓: SAMPLE /WAIT again             │
          │  if /WAIT=low → another TW                       │
          │  if /WAIT=high → proceed to T3                   │
          │                                                  │
@@ -120,29 +158,26 @@ Entry: /M1 goes low (observed at T1 rising edge)
          │  /MREQ ↑, /RD ↑                                  │
          │  Address bus transitions to refresh address      │
          │  /RFSH ↓                                         │
-         │                                                  │
-  T3 ↓   │  /MREQ ↓ (for refresh)                           │
-         │  ► CAPTURE refresh address (low 7 bits = R reg)  │
+         │  ⚡ POLL for T3↓: CAPTURE refresh addr A[6:0]    │
          │                                                  │
   T4 ↑   │  /MREQ ↑ (refresh complete)                      │
          │  /RFSH ↑, /M1 ↑                                  │
          │  ► SAMPLE /BUSREQ (for possible bus release)     │
          │  ► SAMPLE /INT, /NMI (at end of last M cycle     │
          │    of instruction only — tracked by decoder)     │
-         │                                                  │
-  T4 ↓   │  → Next cycle's T1 follows                       │
+         │  → Next cycle's T1 follows at next CLK ↑         │
          └──────────────────────────────────────────────────┘
 
 Capture record:
   { type: M1_FETCH, addr: A[15:0]@T1↑, data: D[7:0]@T3↑,
-    refresh: A[6:0]@T3↓, waits: count_of_TW,
+    refresh: A[6:0]@T3↓⚡, waits: count_of_TW,
     halt: /HALT level }
 ```
 
 ### 4.2 MEMORY READ — Ref: Figure 6 (left half)
 
 ```
-Entry: /M1 high, then /MREQ↓ + /RD↓ observed at T1↓
+Entry: /M1 high at T1↑, /MREQ low + /RD low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              Memory Read Cycle                   │
@@ -150,36 +185,33 @@ Entry: /M1 high, then /MREQ↓ + /RD↓ observed at T1↓
   T1 ↑   │  Address bus = memory address                    │
          │  ► CAPTURE address                               │
          │                                                  │
-  T1 ↓   │  /MREQ ↓, /RD ↓                                  │
-         │                                                  │
-  T2 ↑   │  (memory responding)                             │
-         │                                                  │
-  T2 ↓   │  ► SAMPLE /WAIT                                  │
+  T2 ↑   │  /MREQ=low, /RD=low (confirms memory read)      │
+         │  ⚡ POLL for T2↓: SAMPLE /WAIT                   │
          │  if /WAIT=low → insert TW                        │
          │  if /WAIT=high → proceed to T3                   │
          │                                                  │
-  TW ↓   │  ► SAMPLE /WAIT (repeat as needed)               │
+  TW ↑   │  (wait state — may repeat)                       │
+         │  ⚡ POLL for TW↓: SAMPLE /WAIT                   │
          │                                                  │
   T3 ↑   │  /MREQ ↑, /RD ↑                                  │
          │  (data bus still valid — hold time after /RD↑)   │
-         │                                                  │
-  T3 ↓   │  ► CAPTURE data bus (read data)                  │
-         │  → Next cycle's T1 follows                       │
+         │  ⚡ POLL for T3↓: CAPTURE data bus (read data)   │
+         │  → Next cycle's T1 follows at next CLK ↑         │
          └──────────────────────────────────────────────────┘
 
-NOTE: Unlike M1 fetch (which samples at T3↑), non-M1 memory read
-samples data at T3↓. The timing diagram confirms data remains
-stable through T3↓ even though /RD rises at T3↑.
+NOTE: Unlike M1 fetch (which captures data at T3↑), non-M1 memory read
+captures data at T3↓ via GPIO poll. The data remains stable through T3↓
+even though /RD rises at T3↑.
 
 Capture record:
-  { type: MEM_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↓,
+  { type: MEM_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↓⚡,
     waits: count_of_TW }
 ```
 
 ### 4.3 MEMORY WRITE — Ref: Figure 6 (right half)
 
 ```
-Entry: /M1 high, then /MREQ↓ at T1↓, /WR↓ early in T2
+Entry: /M1 high at T1↑, /MREQ low + /WR low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              Memory Write Cycle                  │
@@ -187,22 +219,17 @@ Entry: /M1 high, then /MREQ↓ at T1↓, /WR↓ early in T2
   T1 ↑   │  Address bus = memory address                    │
          │  ► CAPTURE address                               │
          │                                                  │
-  T1 ↓   │  /MREQ ↓                                         │
-         │  Data bus begins to carry write data             │
-         │                                                  │
-  T2 ↑   │  /WR ↓ (data bus now stable)                     │
-         │  ► CAPTURE data bus (write data)                 │
-         │                                                  │
-  T2 ↓   │  ► SAMPLE /WAIT                                  │
+  T2 ↑   │  /MREQ=low, /WR=low (confirms memory write)     │
+         │  ► CAPTURE data bus (write data — stable by T2↑) │
+         │  ⚡ POLL for T2↓: SAMPLE /WAIT                   │
          │  if /WAIT=low → insert TW                        │
          │  if /WAIT=high → proceed to T3                   │
          │                                                  │
-  TW ↓   │  ► SAMPLE /WAIT (repeat as needed)               │
+  TW ↑   │  (wait state — may repeat)                       │
+         │  ⚡ POLL for TW↓: SAMPLE /WAIT                   │
          │                                                  │
-  T3 ↑   │  /WR ↑ (half T-state before bus changes)         │
-         │                                                  │
-  T3 ↓   │  /MREQ ↑, address+data bus change                │
-         │  → Next cycle's T1 follows                       │
+  T3 ↑   │  /WR ↑ (data hold satisfied)                     │
+         │  → Next cycle's T1 follows at next CLK ↑         │
          └──────────────────────────────────────────────────┘
 
 Note: /WR goes inactive at T3↑, half a T-state before address
@@ -216,7 +243,7 @@ Capture record:
 ### 4.4 I/O READ — Ref: Figure 7 (upper half)
 
 ```
-Entry: /M1 high, /MREQ stays high, /IORQ↓ + /RD↓ at T2↑
+Entry: /M1 high at T1↑, /IORQ low + /RD low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              I/O Read Cycle                      │
@@ -225,28 +252,24 @@ Entry: /M1 high, /MREQ stays high, /IORQ↓ + /RD↓ at T2↑
          │  (A[7:0] = port, A[15:8] = register content)     │
          │  ► CAPTURE address                               │
          │                                                  │
-  T1 ↓   │  (nothing yet — /MREQ stays high)                │
-         │                                                  │
-  T2 ↑   │  /IORQ ↓, /RD ↓                                  │
-         │                                                  │
-  T2 ↓   │  (this is the AUTO-INSERTED wait state TW)       │
-         │  ► SAMPLE /WAIT (during auto TW)                 │
+  T2 ↑   │  /IORQ=low, /RD=low (confirms I/O read)         │
+         │  (auto-inserted wait TW* follows)                │
+         │  ⚡ POLL for T2↓: SAMPLE /WAIT (during auto TW)  │
          │  if /WAIT=low → insert additional TW             │
          │  if /WAIT=high → proceed to T3                   │
          │                                                  │
   TW* ↑  │  (automatic wait — always present)               │
-         │                                                  │
-  TW* ↓  │  ► SAMPLE /WAIT                                  │
+         │  ⚡ POLL for TW*↓: SAMPLE /WAIT                  │
          │  if /WAIT=low → additional TW                    │
          │  if /WAIT=high → proceed to T3                   │
          │                                                  │
-  TW ↓   │  ► SAMPLE /WAIT (repeat as needed)               │
+  TW ↑   │  (additional wait states if /WAIT held low)      │
+         │  ⚡ POLL for TW↓: SAMPLE /WAIT                   │
          │                                                  │
   T3 ↑   │  /IORQ ↑, /RD ↑                                  │
          │  (data bus still valid — hold time after /RD↑)   │
-         │                                                  │
-  T3 ↓   │  ► CAPTURE data bus (read data)                  │
-         │  → Next cycle's T1 follows                       │
+         │  ⚡ POLL for T3↓: CAPTURE data bus (read data)   │
+         │  → Next cycle's T1 follows at next CLK ↑         │
          └──────────────────────────────────────────────────┘
 
 IMPORTANT: The cycle is T1-T2-TW*-T3 minimum (4 CLK periods).
@@ -255,14 +278,14 @@ from /IORQ going active to the WAIT sample point is too short
 for I/O devices to decode their address and assert /WAIT.
 
 Capture record:
-  { type: IO_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↓,
+  { type: IO_RD, addr: A[15:0]@T1↑, data: D[7:0]@T3↓⚡,
     waits: 1 + count_of_additional_TW }
 ```
 
 ### 4.5 I/O WRITE — Ref: Figure 7 (lower half)
 
 ```
-Entry: /M1 high, /MREQ stays high, /IORQ↓ + /WR↓ at T2↑
+Entry: /M1 high at T1↑, /IORQ low + /WR low at T2↑
 
          ┌──────────────────────────────────────────────────┐
          │              I/O Write Cycle                     │
@@ -270,19 +293,18 @@ Entry: /M1 high, /MREQ stays high, /IORQ↓ + /WR↓ at T2↑
   T1 ↑   │  Address bus = port address                      │
          │  ► CAPTURE address                               │
          │                                                  │
-  T1 ↓   │  (nothing yet)                                   │
-         │                                                  │
-  T2 ↑   │  /IORQ ↓, /WR ↓                                  │
+  T2 ↑   │  /IORQ=low, /WR=low (confirms I/O write)        │
          │  Data bus = write data (stable)                  │
          │  ► CAPTURE data bus (write data)                 │
-         │                                                  │
-  TW* ↓  │  (automatic wait — always present)               │
-         │  ► SAMPLE /WAIT                                  │
+         │  (auto-inserted wait TW* follows)                │
+         │  ⚡ POLL for TW*↓: SAMPLE /WAIT                  │
          │  (same extension logic as I/O read)              │
          │                                                  │
-  T3 ↑   │  /WR ↑, /IORQ ↑                                  │
+  TW ↑   │  (additional wait states if needed)              │
+         │  ⚡ POLL for TW↓: SAMPLE /WAIT                   │
          │                                                  │
-  T3 ↓   │  → Next cycle's T1 follows                       │
+  T3 ↑   │  /WR ↑, /IORQ ↑                                  │
+         │  → Next cycle's T1 follows at next CLK ↑         │
          └──────────────────────────────────────────────────┘
 
 Capture record:
@@ -293,8 +315,7 @@ Capture record:
 ### 4.6 INTERRUPT ACKNOWLEDGE — Ref: Figure 9
 
 ```
-Entry: /M1 goes low at T1↑, but /MREQ does NOT go low at T1↓.
-       Instead, /IORQ goes low (with /M1 still low) at T2↓.
+Entry: /M1 low at T1↑, /MREQ HIGH at T2↑ (distinguishes from fetch)
 
          ┌──────────────────────────────────────────────────┐
          │          Interrupt Acknowledge Cycle             │
@@ -302,31 +323,27 @@ Entry: /M1 goes low at T1↑, but /MREQ does NOT go low at T1↓.
   T1 ↑   │  /M1 ↓, Address bus = PC (but not used)          │
          │  ► CAPTURE address (PC at time of interrupt)     │
          │                                                  │
-  T1 ↓   │  /MREQ stays HIGH (key discriminator vs fetch)   │
-         │                                                  │
-  T2 ↑   │  (nothing yet)                                   │
-         │                                                  │
-  T2 ↓   │  /IORQ ↓ (signals interrupt acknowledge)         │
+  T2 ↑   │  /MREQ still HIGH (confirms INT ACK, not fetch)  │
+         │  (/IORQ goes low at T2↓ — detected by poll)      │
          │                                                  │
   TW1*↑  │  (first automatic wait — always present)         │
-  TW1*↓  │  ► SAMPLE /WAIT                                  │
+         │  ⚡ POLL for TW1*↓: SAMPLE /WAIT                 │
          │                                                  │
   TW2*↑  │  (second automatic wait — always present)        │
-  TW2*↓  │  ► SAMPLE /WAIT                                  │
+         │  ⚡ POLL for TW2*↓: SAMPLE /WAIT                 │
          │  if /WAIT=low → additional TW                    │
          │  if /WAIT=high → proceed to T3                   │
          │                                                  │
-  TW ↓   │  ► SAMPLE /WAIT (repeat as needed)               │
+  TW ↑   │  (additional wait states if needed)              │
+         │  ⚡ POLL for TW↓: SAMPLE /WAIT                   │
          │                                                  │
   T3 ↑   │  /IORQ ↑, /M1 ↑                                  │
          │  (data bus still valid — vector byte held)       │
-         │                                                  │
-  T3 ↓   │  ► CAPTURE data bus (interrupt vector byte)      │
+         │  ⚡ POLL for T3↓: CAPTURE data bus (vector byte) │
          │  Refresh cycle follows (same as normal M1)       │
          │                                                  │
   T4 ↑   │  Refresh complete                                │
-         │                                                  │
-  T4 ↓   │  → Next cycle (PUSH PC, then jump to ISR)        │
+         │  → Next cycle (PUSH PC, then jump to ISR)        │
          └──────────────────────────────────────────────────┘
 
 IMPORTANT: Two automatic wait states are always inserted to allow
@@ -337,7 +354,7 @@ The interrupt vector on D[7:0] depends on the interrupt mode:
   Mode 2: low byte of vector table pointer (high byte = I register)
 
 Capture record:
-  { type: INT_ACK, addr: A[15:0]@T1↑, data: D[7:0]@T3↓,
+  { type: INT_ACK, addr: A[15:0]@T1↑, data: D[7:0]@T3↓⚡,
     waits: 2 + count_of_additional_TW }
 ```
 
@@ -466,20 +483,20 @@ Combining all cycle types, the top-level state machine is:
                │    ▼         ▼           ▼
                │  /M1=low   /M1=high    /M1=high
                │    │         │           │
-               │    │    T1↓:/MREQ↓  T1↓:/MREQ stays high
-               │    │         │           │
-               │    │    ┌────┴────┐  T2↑:/IORQ↓
+               │    │    ┌────┴────┐      │
+               │    │    │   T2↑   │      │  T2↑
                │    │    │         │      │
-               │    │  /RD↓      /WR↓  ┌──┴───┐
-               │    │    │         │   │      │
-               │    │    ▼         ▼  /RD↓   /WR↓
-               │    │ MEM_READ MEM_WR  │      │
-               │    │                  ▼      ▼
-               │    │              IO_READ IO_WRITE
+               │    │  /MREQ=low  /MREQ=high
+               │    │    │         │
+               │    │  ┌─┴──┐   ┌──┴──┐
+               │    │ /RD  /WR /RD   /WR
+               │    │  ↓    ↓   ↓     ↓
+               │    │ MEM  MEM IO    IO
+               │    │ READ WR  READ  WRITE
                │    │
-               │    ├── T1↓: /MREQ↓ ?
+               │    ├── T2↑: /MREQ low?
                │    │     Yes → OPCODE_FETCH
-               │    │     No  → INT_ACK (wait for /IORQ↓ at T2)
+               │    │     No  → INT_ACK
                │    │
                │    ▼
                │  ┌───────────┬──────────────┐
@@ -489,58 +506,121 @@ Combining all cycle types, the top-level state machine is:
                └──── (can interrupt any state)
 ```
 
+All decisions are made at rising CLK edges (T1↑ and T2↑).
+
 ---
 
-## 6. T-State Counting and CLK Edge Actions
+## 6. CLK Edge Actions Summary
 
-Summary table of what the analyzer does at each CLK edge:
-
-### Rising Edge (CLK ↑)
+### Rising Edge (CLK ↑) — PIO-sampled, drives all state transitions
 
 | State              | T  | Action                                             |
 |--------------------|----|----------------------------------------------------|
 | Any cycle          | T1 | Capture A[15:0]. Check /M1. Begin cycle ID.        |
+| Any cycle          | T2 | Check /MREQ, /IORQ, /RD, /WR → determine type.    |
 | M1_FETCH           | T3 | Capture D[7:0] = opcode. /MREQ↑, /RD↑.             |
 | M1_FETCH           | T4 | /RFSH↑, /M1↑. Sample /BUSREQ, /INT, /NMI.          |
-| MEM_READ           | T3 | /MREQ↑, /RD↑. (data still valid, captured at ↓)    |
-| MEM_WRITE          | T2 | Capture D[7:0] = write data. /WR↓ goes active.     |
-| MEM_WRITE          | T3 | /WR↑ (data hold satisfied).                        |
-| IO_READ            | T2 | /IORQ↓, /RD↓.                                      |
-| IO_READ            | T3 | /IORQ↑, /RD↑. (data still valid, captured at ↓)    |
+| MEM_READ           | T3 | /MREQ↑, /RD↑. (data captured at T3↓ via poll)      |
+| MEM_WRITE          | T2 | Capture D[7:0] = write data. /WR↓ already active.  |
+| MEM_WRITE          | T3 | /WR↑ (data hold satisfied). Cycle complete.         |
+| IO_READ            | T3 | /IORQ↑, /RD↑. (data captured at T3↓ via poll)      |
 | IO_WRITE           | T2 | /IORQ↓, /WR↓. Capture D[7:0] = write data.         |
-| IO_WRITE           | T3 | /WR↑, /IORQ↑.                                      |
-| INT_ACK            | T3 | /IORQ↑, /M1↑. (data still valid, captured at ↓)    |
+| IO_WRITE           | T3 | /WR↑, /IORQ↑. Cycle complete.                      |
+| INT_ACK            | T3 | /IORQ↑, /M1↑. (data captured at T3↓ via poll)      |
 | BUS_RELEASED       | Tx | Sample /BUSREQ. If high → exit to IDLE.            |
 
-### Falling Edge (CLK ↓)
+### Falling Edge (CLK ↓) — GPIO poll / secondary PIO, on demand only
 
 | State              | T   | Action                                            |
 |--------------------|-----|---------------------------------------------------|
-| M1_FETCH           | T1  | /MREQ↓, /RD↓. Confirms fetch (vs INT_ACK).        |
-| M1_FETCH           | T2  | Sample /WAIT. If low → enter TW.                  |
-| M1_FETCH           | TW  | Sample /WAIT. If low → repeat TW. If high → T3.   |
-| M1_FETCH           | T3  | /MREQ↓ (refresh). Capture refresh addr A[6:0].    |
-| MEM_READ           | T1  | /MREQ↓, /RD↓.                                     |
-| MEM_READ           | T2  | Sample /WAIT.                                     |
-| MEM_READ           | TW  | Sample /WAIT.                                     |
-| MEM_READ           | T3  | ► Capture D[7:0] = read data.                     |
-| MEM_WRITE          | T1  | /MREQ↓.                                           |
-| MEM_WRITE          | T2  | Sample /WAIT.                                     |
-| MEM_WRITE          | TW  | Sample /WAIT.                                     |
-| IO_READ            | TW* | Sample /WAIT (auto-inserted wait).                |
-| IO_READ            | TW  | Sample /WAIT (additional waits).                  |
-| IO_READ            | T3  | ► Capture D[7:0] = read data.                     |
-| IO_WRITE           | TW* | Sample /WAIT.                                     |
-| IO_WRITE           | TW  | Sample /WAIT.                                     |
-| INT_ACK            | T2  | /IORQ↓.                                           |
-| INT_ACK            | TW1*| Sample /WAIT (first auto wait).                   |
-| INT_ACK            | TW2*| Sample /WAIT (second auto wait).                  |
-| INT_ACK            | TW  | Sample /WAIT (additional).                        |
-| INT_ACK            | T3  | ► Capture D[7:0] = interrupt vector.              |
+| M1_FETCH           | T2  | ⚡ Sample /WAIT. If low → enter TW.               |
+| M1_FETCH           | TW  | ⚡ Sample /WAIT. If low → repeat TW.              |
+| M1_FETCH           | T3  | ⚡ Capture refresh addr A[6:0].                   |
+| MEM_READ           | T2  | ⚡ Sample /WAIT.                                  |
+| MEM_READ           | TW  | ⚡ Sample /WAIT.                                  |
+| MEM_READ           | T3  | ⚡ Capture D[7:0] = read data.                    |
+| MEM_WRITE          | T2  | ⚡ Sample /WAIT.                                  |
+| MEM_WRITE          | TW  | ⚡ Sample /WAIT.                                  |
+| IO_READ            | TW* | ⚡ Sample /WAIT (auto-inserted wait).              |
+| IO_READ            | TW  | ⚡ Sample /WAIT (additional waits).                |
+| IO_READ            | T3  | ⚡ Capture D[7:0] = read data.                    |
+| IO_WRITE           | TW* | ⚡ Sample /WAIT.                                  |
+| IO_WRITE           | TW  | ⚡ Sample /WAIT.                                  |
+| INT_ACK            | TW1*| ⚡ Sample /WAIT (first auto wait).                |
+| INT_ACK            | TW2*| ⚡ Sample /WAIT (second auto wait).               |
+| INT_ACK            | TW  | ⚡ Sample /WAIT (additional).                     |
+| INT_ACK            | T3  | ⚡ Capture D[7:0] = interrupt vector.             |
+
+⚡ = falling-edge action performed via GPIO polling or secondary PIO,
+not the main rising-edge PIO state machine.
 
 ---
 
-## 7. Capture Record Format
+## 7. Falling-Edge Capture Strategy
+
+The ARM core on core 1 handles falling-edge operations using one of two
+approaches (to be determined during implementation based on measured timing):
+
+### Option A: GPIO Polling
+
+After processing a rising edge, if the current state requires a falling-edge
+sample, the ARM core busy-waits on the CLK GPIO pin:
+
+```
+while (gpio_get(CLK_PIN) == 1) { /* spin */ }
+// CLK just went low — read the bus
+uint32_t bus = gpio_get_all();
+```
+
+**Pros**: No additional PIO resources needed. Simple. Deterministic.
+**Cons**: Burns CPU cycles spinning. At 4 MHz Z80 clock (125 ns per half
+cycle), with a 300 MHz ARM core, that's ~37 ARM cycles of spin time.
+Acceptable since core 1 is dedicated to the analyzer.
+
+### Option B: Secondary PIO State Machine
+
+A second PIO SM is configured to wait for CLK falling edge and push GPIO
+snapshot to a separate FIFO. The ARM core reads this FIFO only when needed.
+
+```
+; Secondary PIO: wait for CLK falling edge, push GPIO snapshot
+wait 1 pin CLK_PIN    ; wait for CLK high
+wait 0 pin CLK_PIN    ; wait for CLK low
+in pins, 32           ; capture all GPIO
+push                  ; to FIFO
+```
+
+The ARM core drains or ignores this FIFO depending on whether the current
+state needs falling-edge data. The secondary PIO runs continuously but the
+FIFO read is conditional.
+
+**Pros**: Precise timing, no CPU spin. FIFO buffering.
+**Cons**: Uses a second PIO SM and FIFO. Must manage FIFO overflow for
+falling edges that aren't consumed.
+
+### When falling-edge capture is needed
+
+Every cycle type requires at least one falling-edge sample (for /WAIT).
+Wait states are used in the target system and must always be tracked.
+
+| Cycle Type    | Falling-edge captures needed                         |
+|---------------|-------------------------------------------------------|
+| M1_FETCH      | T2↓ (/WAIT), TW↓ (/WAIT), T3↓ (refresh addr)        |
+| MEM_READ      | T2↓ (/WAIT), TW↓ (/WAIT), T3↓ (data bus)             |
+| MEM_WRITE     | T2↓ (/WAIT), TW↓ (/WAIT)                             |
+| IO_READ       | TW*↓ (/WAIT), TW↓ (/WAIT), T3↓ (data bus)            |
+| IO_WRITE      | TW*↓ (/WAIT), TW↓ (/WAIT)                            |
+| INT_ACK       | TW1*↓, TW2*↓, TW↓ (/WAIT), T3↓ (data bus)           |
+
+Note: Since /WAIT must always be sampled, every cycle needs at least one
+falling-edge read. The advantage of the rising-edge-only PIO architecture
+is that the falling-edge work is done inline (poll or FIFO read) rather
+than doubling the PIO sample rate. The ARM core decides *which* falling
+edges matter based on state, rather than processing all of them.
+
+---
+
+## 8. Capture Record Format
 
 Each completed machine cycle produces one trace record:
 
@@ -550,14 +630,14 @@ struct TraceRecord {
                          IO_RD, IO_WR, INT_ACK,
                          BUS_RELEASED, RESET },
     address:      u16,          // A[15:0] captured at T1↑
-    data:         u8,           // D[7:0] — sample edge depends on cycle:
-                                 //   M1_FETCH: T3↑ (rising edge)
-                                 //   MEM_RD:   T3↓ (falling edge)
-                                 //   MEM_WR:   T2↑ (rising edge)
-                                 //   IO_RD:    T3↓ (falling edge)
-                                 //   IO_WR:    T2↑ (rising edge)
-                                 //   INT_ACK:  T3↓ (falling edge)
-    refresh_addr: u7,           // only for M1_FETCH: A[6:0] at T3↓
+    data:         u8,           // D[7:0] — sample point depends on cycle:
+                                 //   M1_FETCH: T3↑ (rising edge, PIO)
+                                 //   MEM_RD:   T3↓ (falling edge, ⚡poll)
+                                 //   MEM_WR:   T2↑ (rising edge, PIO)
+                                 //   IO_RD:    T3↓ (falling edge, ⚡poll)
+                                 //   IO_WR:    T2↑ (rising edge, PIO)
+                                 //   INT_ACK:  T3↓ (falling edge, ⚡poll)
+    refresh_addr: u7,           // only for M1_FETCH: A[6:0] at T3↓ ⚡poll
     wait_count:   u8,           // number of TW states inserted
     halt:         bool,         // /HALT was active during this cycle
     clk_count:    u32,          // absolute CLK count for timestamp
@@ -567,39 +647,44 @@ struct TraceRecord {
 
 ---
 
-## 8. Discrimination Timing — Critical Windows
+## 9. Discrimination Timing — Critical Windows
 
-The analyzer must make cycle-type decisions within tight windows.
-Here are the critical decision points:
+The analyzer makes all cycle-type decisions at rising CLK edges:
 
 ```
 CLK ↑ (T1)
   │
-  ├─ /M1 low? ──────────────────── YES → M1 class cycle
-  │                                        │
-  │  CLK ↓ (T1)                            │
-  │    │                                   │
-  │    ├─ /MREQ low? ──── YES → OPCODE FETCH
-  │    │                   NO  → INT_ACK (confirm at T2: /IORQ↓)
-  │    │
-  │    ├─ /MREQ low?
-  │    │    YES → Memory cycle
-  │    │           /RD low → MEM_READ
-  │    │           (else)  → MEM_WRITE (confirmed when /WR↓ at T2↑)
-  │    │    NO  → I/O cycle (confirmed at T2↑ when /IORQ↓)
-  │    │           /RD↓ → IO_READ
-  │    │           /WR↓ → IO_WRITE
+  ├─ /RESET = low? ─────────────── YES → RESET state
+  ├─ /BUSACK = low? ────────────── YES → BUS_RELEASED
   │
-  ├─ /BUSACK low? ──────────────── YES → BUS_RELEASED
-  ├─ /RESET low? ───────────────── YES → RESET
-  └─ else → continue in current multi-T-state cycle
+  ├─ Capture A[15:0]
+  ├─ /M1 low? ──────────────────── YES → M1 class cycle
+  │                                 NO → non-M1 class cycle
+  │
+  ▼
+CLK ↑ (T2)  ← all control signals have settled
+  │
+  ├─ M1 class:
+  │    /MREQ low? ──── YES → OPCODE FETCH
+  │                     NO → INT_ACK
+  │
+  ├─ non-M1 class:
+  │    /MREQ low?
+  │       YES → Memory cycle
+  │              /RD low → MEM_READ
+  │              /WR low → MEM_WRITE
+  │       NO  → I/O cycle (/IORQ low)
+  │              /RD low → IO_READ
+  │              /WR low → IO_WRITE
 ```
+
+No falling-edge decisions are needed for cycle type identification.
 
 ---
 
-## 9. Practical Considerations for Analyzer Implementation
+## 10. Practical Considerations for Analyzer Implementation
 
-### 9.1 What the analyzer CANNOT see from bus signals alone
+### 10.1 What the analyzer CANNOT see from bus signals alone
 
 - **Instruction boundaries**: The analyzer knows M1 fetches start a new
   instruction, but multi-byte instructions (prefixed with CB, DD, ED, FD)
@@ -615,7 +700,7 @@ CLK ↑ (T1)
 - **Stack pointer value**: Must track SP-modifying instructions to annotate
   PUSH/POP/CALL/RET memory accesses.
 
-### 9.2 M1 cycle length ambiguity
+### 10.2 M1 cycle length ambiguity
 
 Standard M1 is 4 T-states (T1-T2-T3-T4).
 But the manual states the first M cycle "is four, five, or six T cycles long."
@@ -627,43 +712,161 @@ on the bus during the extra T-states look like "internal operation" —
 no /MREQ, /IORQ, /RD, /WR activity. The analyzer should detect these
 as idle bus states within the instruction.
 
-### 9.3 Suggested implementation approach
+### 10.3 Performance budget at 4 MHz Z80
 
-The analyzer's main loop:
+At 4 MHz Z80 clock, each T-state is 250 ns. With a 300 MHz ARM core,
+that's 75 ARM clock cycles per Z80 T-state. The target budget is
+**~70 ARM cycles per rising edge**, leaving a small margin.
+
+The rising-edge-only PIO architecture provides the full 250 ns budget
+for processing each T-state, versus 125 ns with dual-edge sampling.
+
+**Per rising edge budget breakdown** (approximate):
+- Read PIO FIFO: ~2 cycles
+- Decode state + extract signals: ~10 cycles
+- State machine logic + branching: ~15 cycles
+- GPIO poll for falling edge (when needed): ~37 cycles spin + ~3 read
+- Write to PSRAM ring buffer (when record complete): ~10 cycles
+- **Total worst case: ~70 cycles** (T-states with falling-edge work)
+- **Total best case: ~30 cycles** (T-states with no falling-edge work, e.g. T1, T4)
+
+**Critical**: These cycle counts must be **measured, not estimated**.
+During implementation, every state machine path must be instrumented
+with cycle counters to verify the budget is met. See §10.6.
+
+### 10.4 PSRAM ring buffer
+
+Trace records are buffered into the PGA2350's PSRAM, not streamed over USB.
+USB CDC bandwidth (~1 MB/s) cannot sustain the trace record rate at 4 MHz
+Z80 clock.
+
+- PSRAM capacity: 8 MB (PGA2350), providing storage for millions of
+  trace records depending on encoding
+- Ring buffer with head/tail pointers; core 1 writes, core 0 reads
+  for USB transfer after capture stops
+- Core 0 handles USB communication: receives commands (start/stop capture,
+  configure triggers, download trace), transmits buffered trace data
+- Capture continues until: trigger stop condition met, PSRAM full (with
+  configurable wrap/stop policy), or host sends stop command
+
+### 10.5 Trigger system (firmware-resident)
+
+All trigger logic runs in the tracer firmware, not the host client.
+The client is used only for configuration, visualization, and analysis.
+
+Trigger conditions evaluated by the state machine on core 1:
+- **Address match**: start/stop capture when PC or address bus matches
+  a value or range
+- **Data match**: capture when specific opcode or data byte seen
+- **Cycle type filter**: capture only specific cycle types
+- **Combined conditions**: AND/OR of the above
+
+Trigger actions:
+- Start capture (fill PSRAM from this point)
+- Stop capture (freeze PSRAM contents)
+- Snapshot (capture N records around trigger point, pre/post)
+
+The trigger evaluation must fit within the per-rising-edge cycle budget.
+Simple comparisons (address == value) are cheap (~3 cycles). More complex
+triggers may need careful optimization.
+
+### 10.6 Performance measurement and testing
+
+Since the 70-cycle budget is tight, performance must be continuously
+monitored during development:
+
+**Cycle-counting instrumentation**: Use the ARM cycle counter (DWT_CYCCNT
+or RP2350 equivalent) to measure the actual cycle count of each state
+machine iteration. Track min/max/histogram per state.
+
+**Test programs for the Z80 side**:
+- **NOP sled**: Continuous NOPs — exercises M1 fetch path at maximum rate
+  (4 T-states per instruction = 1 MHz instruction rate at 4 MHz clock)
+- **Memory copy loop**: Exercises MEM_RD + MEM_WR cycles back-to-back
+- **I/O burst**: Rapid IN/OUT instructions — exercises I/O paths with
+  auto-wait states
+- **Wait-heavy workload**: Target system with slow peripherals asserting
+  /WAIT — verifies wait state handling under load
+- **Interrupt storm**: Frequent interrupts — exercises INT_ACK path
+- **Prefix-heavy code**: DD/FD/CB/ED prefixed instructions — exercises
+  extended M1 sequences
+
+**Synthetic clock for bench testing**: Before real Z80 hardware is available,
+drive the CLK pin and bus signals from a second RP2350 or signal generator
+to verify timing at exact 4 MHz. This avoids depending on real hardware
+for performance validation.
+
+**Overflow detection**: The state machine must detect if it falls behind
+(PIO FIFO overrun). If a FIFO overrun is detected, flag it in the trace
+stream so the host client can report the gap.
+
+### 10.7 Suggested implementation approach
 
 ```
-on every CLK rising edge:
+on every PIO rising-edge sample:
     if /RESET = low:
         state = RESET; return
     if /BUSACK = low:
         state = BUS_RELEASED; return
-    if state expects T1:
-        capture address
+
+    switch (state):
+    case IDLE / expecting T1:
+        capture address from PIO sample
         if /M1 = low:
             cycle_class = M1
         else:
             cycle_class = NON_M1
-        advance to T1_done, wait for falling edge
+        evaluate trigger (address match)
+        state = T1_DONE
 
-on every CLK falling edge:
-    if in T1 and cycle_class = M1:
-        if /MREQ = low:
-            cycle_type = OPCODE_FETCH
+    case T1_DONE (this is T2↑):
+        if cycle_class = M1:
+            if /MREQ = low:
+                cycle_type = OPCODE_FETCH
+            else:
+                cycle_type = INT_ACK
         else:
-            cycle_type = INT_ACK
-    if in T1 and cycle_class = NON_M1:
-        if /MREQ = low:
-            cycle_type = (will check /RD vs /WR next)
+            if /MREQ = low:
+                if /RD = low: cycle_type = MEM_READ
+                else:         cycle_type = MEM_WRITE
+                              capture data (write data at T2↑)
+            else:
+                if /RD = low: cycle_type = IO_READ
+                else:         cycle_type = IO_WRITE
+                              capture data (write data at T2↑)
+
+        ⚡ poll_falling_edge()  // for /WAIT sampling
+        check /WAIT → manage wait states
+        state = T2_DONE
+
+    case T2_DONE / TW (this is T3↑ or TW↑):
+        if in TW:
+            ⚡ poll_falling_edge()  // sample /WAIT again
+            if /WAIT still low → stay in TW; return
+        // Now at T3↑
+        if cycle needs rising-edge data (M1_FETCH, MEM_WR, IO_WR):
+            capture data from PIO sample
+        if cycle needs falling-edge data (MEM_RD, IO_RD, INT_ACK):
+            ⚡ poll_falling_edge()
+            capture data from GPIO
+        if M1_FETCH:
+            ⚡ poll_falling_edge()  // capture refresh addr
+            state = T3_DONE (wait for T4↑)
         else:
-            pending_IO = true  (confirm at T2↑)
-    if in T2 or TW:
-        check /WAIT → insert or exit wait states
-    ...proceed through cycle state machine...
+            evaluate trigger (data/type match)
+            write trace record to PSRAM ring buffer
+            state = IDLE
+
+    case T3_DONE (M1 T4↑):
+        sample /BUSREQ, /INT, /NMI, /HALT
+        evaluate trigger (opcode match)
+        write trace record to PSRAM ring buffer
+        state = IDLE
 ```
 
 ---
 
-## 10. Cross-Reference to Manual Figures
+## 11. Cross-Reference to Manual Figures
 
 | Figure     | Manual Page | State Machine Section | Cycle Type            |
 |------------|-------------|-----------------------|-----------------------|
@@ -680,7 +883,7 @@ on every CLK falling edge:
 
 ---
 
-## 11. Open Questions for Review
+## 12. Open Questions for Review
 
 1. **I/O auto-wait counting**: The manual shows TW* between T2 and T3 in
    Fig. 7. Is /WAIT sampled during TW* (i.e., can the I/O device add
@@ -710,3 +913,39 @@ on every CLK falling edge:
    CPU re-fetches the same address, the HALT instruction itself, but
    forces NOP internally.) The analyzer should see the same address
    repeating.
+
+6. **GPIO poll timing margin**: At 4 MHz, the falling edge arrives 125 ns
+   after the rising edge. With 300 MHz ARM, that's ~37 cycles. The GPIO
+   poll spin loop needs to be tight (ideally 2-3 instructions per
+   iteration). Verify that the GPIO read path doesn't add latency that
+   could cause the poll to miss the window. **This must be measured
+   empirically early in implementation.**
+
+7. **Secondary PIO vs GPIO poll**: Decision to be made based on measured
+   timing. GPIO poll is simpler but ties up the core for ~37 cycles.
+   Secondary PIO is cleaner but uses PIO resources and needs FIFO
+   management. Since /WAIT is always sampled, every cycle needs at
+   least one falling-edge read — this tilts toward the secondary PIO
+   approach if GPIO polling proves too tight on the budget.
+
+8. **PSRAM write latency**: The PGA2350 PSRAM is accessed via QSPI.
+   Write latency must be measured to ensure it fits within the cycle
+   budget. If writes are slow, consider batching (accumulate records
+   in SRAM, flush to PSRAM in bulk during idle bus periods or T-states
+   that don't need falling-edge work).
+
+9. **PSRAM capacity vs trace record size**: With 8 MB PSRAM and a
+   compact record encoding, how many trace records can be stored?
+   At 6 bytes/record: ~1.3M records. At 4 MHz with ~2 T-states average
+   per record, that's ~650K instructions or ~0.16 seconds of trace.
+   Consider whether compression or reduced-field encoding is needed.
+
+10. **Trigger complexity vs cycle budget**: How complex can trigger
+    conditions be without exceeding the 70-cycle budget? Simple address
+    compare is ~3 cycles. Range check is ~5. AND of two conditions is
+    ~8. Need to define a trigger language that fits the budget.
+
+11. **Synthetic test clock generation**: What hardware is needed to
+    drive realistic Z80 bus signals at 4 MHz for bench testing? A second
+    PGA2350 running a Z80 bus simulator would be ideal. Define the
+    test harness architecture early.
