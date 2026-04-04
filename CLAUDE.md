@@ -37,7 +37,6 @@ Single test file with smoke tests against synthetic data. Run from repo root.
 - DMA ring buffer (32KB) drains PIO FIFO continuously
 - Core 1 (dedicated): runs the full Z80 bus analyzer state machine, tracking T-states and cycle types per `z80-bus-analyzer-statemachine.md`. Produces `trace_record_t` structs into an inter-core queue.
 - Core 0: services USB CDC, drains trace queue, encodes 6-byte packets
-- Flow control: asserts /WAIT when trace queue is 75% full, releases at 25%
 - Mid-stream sync: on startup or after reset, the analyzer enters sync mode and only locks onto unambiguous M1 cycles (/M1 low at T1↑). Internal operation T-states are handled by re-interpreting rising edges.
 - Supported cycle types: M1 opcode fetch, memory read/write, I/O read/write (with auto-wait), interrupt acknowledge (with 2 auto-waits), reset detection
 
