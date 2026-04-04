@@ -53,9 +53,10 @@ DIAG_SKIP_BOTH     = 0x03
 READOUT_MAGIC      = 0x5A383054  # "Z80T"
 STATUS_MAGIC       = 0x53544154  # "STAT"
 
-# trace_record_t layout: 8 bytes
-RECORD_FMT = '<HBBBBBB'
-RECORD_SIZE = struct.calcsize(RECORD_FMT)  # 8
+# trace_record_t layout: 7 bytes
+# address(u16), data(u8), cycle_type(u8), wait_count(u8), flags(u8), seq(u8)
+RECORD_FMT = '<HBBBBB'
+RECORD_SIZE = struct.calcsize(RECORD_FMT)  # 7
 
 # Cycle type names (matches cycle_type_t enum)
 CYCLE_NAMES = {
@@ -192,11 +193,9 @@ def read_buffer(ser, pre_count, post_count=0, progress=True):
 
 def format_record(rec):
     """Format a single trace record for display."""
-    address, data, cycle_type, refresh, wait_count, flags, seq = rec
+    address, data, cycle_type, wait_count, flags, seq = rec
     name = CYCLE_NAMES.get(cycle_type, f'?{cycle_type}')
     parts = [f"  {name:6s} {address:04X} {data:02X}"]
-    if cycle_type == 0:  # M1 fetch
-        parts.append(f" R={refresh:02X}")
     if wait_count > 0:
         parts.append(f" W={wait_count}")
     flag_strs = []

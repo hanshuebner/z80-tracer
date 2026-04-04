@@ -444,7 +444,7 @@ Each completed machine cycle produces one trace record:
 struct TraceRecord {
     cycle_type:   enum { M1_FETCH, MEM_RD, MEM_WR,
                          IO_RD, IO_WR, INT_ACK,
-                         BUS_RELEASED, RESET },
+                         RESET },
     wait_count:   u8:3,         // number of TW states inserted
     halt:         u8:1,         // /HALT was active during this cycle
     address:      u16,          // A[15:0] captured at T2↑

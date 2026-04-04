@@ -30,7 +30,7 @@
 #define PIN_RFSH        29
 #define PIN_CLK         30
 #define PIN_HALT        31
-#define PIN_WAIT        32  // output (flow control) + input (observe)
+#define PIN_WAIT        32
 #define PIN_INT         33
 #define PIN_NMI         34
 #define PIN_RESET       35
@@ -47,7 +47,7 @@
 // Bit  27:    /RD
 // Bit  28:    /WR
 // Bit  29:    /RFSH
-// Bit  30:    CLK  (1 = sample taken at rising edge, 0 = falling edge)
+// Bit  30:    CLK  (always 1 — rising-edge-only sampling)
 // Bit  31:    /HALT
 
 #define SAMPLE_ADDR_MASK    0x0000FFFF
@@ -75,11 +75,12 @@ typedef enum {
 
 // Trace record produced by analyzer state machine (core 1 → PSRAM ring buffer)
 typedef struct {
-    uint16_t address;       // A[15:0] captured at T1 rising edge
-    uint8_t  data;          // D[7:0] captured at cycle-specific edge
+    uint16_t address;       // A[15:0] captured at T2↑
+    uint8_t  data;          // D[7:0] — sample point depends on cycle type:
+                            //   M1_FETCH: T3↑, MEM_RD: T3↑, MEM_WR: T2↑,
+                            //   IO_RD: T3↑, IO_WR: T2↑, INT_ACK: T3↑
     uint8_t  cycle_type;    // cycle_type_t
-    uint8_t  refresh;       // A[6:0] refresh address (M1_FETCH only)
-    uint8_t  wait_count;    // number of wait states (includes auto-waits for I/O)
+    uint8_t  wait_count;    // number of wait states (includes auto-waits for I/O/INT)
     uint8_t  flags;         // TRACE_FLAG_*
     uint8_t  seq;           // Sequence counter (7-bit, wraps), for gap detection
 } trace_record_t;
@@ -105,7 +106,8 @@ static inline uint8_t sample_data(uint32_t sample) {
 #define CAPTURE_BUF_SIZE_WORDS  (CAPTURE_BUF_SIZE_BYTES / sizeof(uint32_t))
 
 // --- PSRAM trace ring buffer ---
-// 8 MB PSRAM / 8 bytes per record = 1M records, power of 2
+// 8 MB PSRAM / 7 bytes per record ≈ 1.19M records
+// Use power-of-2 count for masking (1M records = 7 MB used)
 #define PSRAM_RING_RECORDS      (1u << 20)    // 1,048,576 records
 #define PSRAM_RING_MASK         (PSRAM_RING_RECORDS - 1)
 

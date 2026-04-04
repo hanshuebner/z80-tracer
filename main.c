@@ -107,85 +107,59 @@ static inline uint32_t dma_write_index(void) {
 // Z80 Bus Analyzer State Machine — runs on core 1
 // ========================================================================
 //
-// Optimized for throughput: each sample must be processed in ~19 ARM
-// cycles at 150 MHz to keep up with a 4 MHz Z80 (8M samples/sec).
+// Rising-edge-only architecture: PIO samples GPIO 0-31 at every CLK
+// rising edge.  Each process_sample() call IS one rising edge.
 //
-// Key optimizations:
-//  - Lazy signal extraction: each state only reads the signals it needs
-//  - PSRAM writes only happen when emitting records (~1.3M/sec), not on
-//    every sample (8M/sec)
-//  - /RESET checked only on rising edges (~4M/sec)
-//  - gpio_hi_in read only in states that need /WAIT, /INT, /NMI
+// Performance budget: ~140 ARM cycles per rising edge at 300 MHz ARM /
+// 4 MHz Z80 (one sample per Z80 clock period = 250 ns).
 //
-// Synchronization: in sync mode, IDLE only accepts M1 cycles (/M1 low
-// at T1↑). Internal operation T-states are handled by re-interpreting
-// the current rising edge as a new potential T1.
+// Cycle type discrimination: deferred to T2↑ where all control signals
+// (/M1, /MREQ, /IORQ, /RD, /WR) have settled.  Address captured at T2↑.
+//
+// Synchronization: in SYNC state, every rising edge is tested for the
+// unambiguous M1 fetch signature (/M1 low + /MREQ low).  Once found,
+// the analyzer locks on and enters normal IDLE→START cycling.
+//
+// Phase recovery: in IDLE (nominally T1↑), if /MREQ or /IORQ is already
+// active, the edge is re-interpreted as T2↑ and discrimination runs
+// immediately.  This self-corrects after odd-count internal operations.
 
 // ---- Analyzer states ----
 
 typedef enum {
-    // Top-level / between cycles
-    ST_IDLE,
-    ST_RESET,
-
-    // T1 — cycle type not yet determined
-    ST_T1_M1,           // T1↑ saw /M1 low, awaiting T1↓
-    ST_T1_NONM1,        // T1↑ saw /M1 high, awaiting T1↓
+    // Synchronization / top-level
+    ST_SYNC,            // Initial sync: test every edge for M1 T2↑
+    ST_IDLE,            // Between cycles (T1↑)
+    ST_START,           // Cycle type discrimination (T2↑)
+    ST_RESET,           // /RESET held low
 
     // M1 opcode fetch (§4.1)
-    ST_M1_T2R,          // awaiting T2↑
-    ST_M1_T2F,          // awaiting T2↓ — /WAIT check
-    ST_M1_TWR,          // wait state ↑
-    ST_M1_TWF,          // wait state ↓ — /WAIT check
-    ST_M1_T3R,          // T3↑ — capture opcode
-    ST_M1_T3F,          // T3↓ — capture refresh addr
-    ST_M1_T4R,          // T4↑ — end of M1, sample interrupts
+    ST_M1_WAIT,         // TW↑ — /WAIT check (may loop)
+    ST_M1_T3,           // T3↑ — capture opcode
+    ST_M1_T4,           // T4↑ — sample /INT, /NMI, emit record
 
     // Memory read (§4.2)
-    ST_MR_T2R,
-    ST_MR_T2F,          // /WAIT check
-    ST_MR_TWR,
-    ST_MR_TWF,          // /WAIT check
-    ST_MR_T3R,
-    ST_MR_T3F,          // capture data
+    ST_MR_WAIT,         // TW↑ — /WAIT check
+    ST_MR_T3,           // T3↑ — capture data, emit
 
     // Memory write (§4.3)
-    ST_MW_T2R,          // capture data at ↑
-    ST_MW_T2F,          // /WAIT check
-    ST_MW_TWR,
-    ST_MW_TWF,          // /WAIT check
-    ST_MW_T3R,
-    ST_MW_T3F,          // done
-
-    // I/O — waiting for T2↑ to determine read vs write (§4.4, §4.5)
-    ST_IO_T2R,
+    ST_MW_WAIT,         // TW↑ — /WAIT check (data already captured at T2↑)
+    ST_MW_T3,           // T3↑ — emit
 
     // I/O read (§4.4)
-    ST_IR_T2F,          // after T2↑ confirmed IO read
-    ST_IR_TWR,          // auto-wait or additional wait ↑
-    ST_IR_TWF,          // auto-wait or additional wait ↓ — /WAIT check
-    ST_IR_T3R,
-    ST_IR_T3F,          // capture data
+    ST_IR_TW,           // TW*↑ auto-wait + additional waits
+    ST_IR_T3,           // T3↑ — capture data, emit
 
     // I/O write (§4.5)
-    ST_IW_T2F,          // after T2↑ confirmed IO write
-    ST_IW_TWR,
-    ST_IW_TWF,          // /WAIT check
-    ST_IW_T3R,
-    ST_IW_T3F,
+    ST_IW_TW,           // TW*↑ auto-wait + additional waits
+    ST_IW_T3,           // T3↑ — emit
 
     // Interrupt acknowledge (§4.6)
-    ST_IA_T2R,
-    ST_IA_T2F,          // /IORQ goes low at T2↓
-    ST_IA_TW1R,         // first auto-wait ↑
-    ST_IA_TW1F,         // first auto-wait ↓
-    ST_IA_TW2R,         // second auto-wait ↑
-    ST_IA_TW2F,         // second auto-wait ↓ — /WAIT check
-    ST_IA_TWR,          // additional wait ↑
-    ST_IA_TWF,          // additional wait ↓ — /WAIT check
-    ST_IA_T3R,
-    ST_IA_T3F,          // capture vector
-    ST_IA_T4R,          // refresh, emit record
+    ST_IA_TW1,          // TW1*↑ — first auto-wait (unconditional)
+    ST_IA_TW2,          // TW2*↑ — second auto-wait, /WAIT check
+    ST_IA_TW,           // TW↑ — additional wait, /WAIT check
+    ST_IA_T3,           // T3↑ — capture vector
+    ST_IA_T4,           // T4↑ — emit
 } state_t;
 
 // ---- Analyzer context ----
@@ -196,7 +170,6 @@ static struct {
     // Current cycle being assembled
     uint16_t address;
     uint8_t  data;
-    uint8_t  refresh;
     uint8_t  wait_count;
     bool     halt;
 
@@ -204,9 +177,6 @@ static struct {
     bool     nmi_prev;
     bool     nmi_pending;
     bool     int_pending;
-
-    // Synchronization: when true, IDLE only accepts M1 cycles
-    bool     syncing;
 
     // Sequence counter for gap detection (7-bit, wraps)
     uint8_t  seq;
@@ -235,7 +205,6 @@ static void __always_inline emit_record(uint8_t cycle_type) {
     dst->address    = az.address;
     dst->data       = az.data;
     dst->cycle_type = cycle_type;
-    dst->refresh    = az.refresh;
     dst->wait_count = az.wait_count;
     dst->flags      = 0;
     dst->seq        = az.seq++ & 0x7F;
@@ -267,410 +236,292 @@ static void __not_in_flash_func(stage_drain_all)(void) {
     }
 }
 
-// ---- Begin a new cycle at T1↑ ----
+// ---- T2↑ cycle type discrimination ----
+// Called from both ST_IDLE (phase recovery) and ST_START (normal path).
+// Determines the cycle type from control signals and sets up the
+// appropriate sub-state-machine.  Per §3 and §9 of the state machine doc.
 
-static void __always_inline begin_cycle(uint32_t sample) {
+static void __always_inline discriminate_t2(uint32_t sample) {
     az.address    = sample_addr(sample);
-    az.data       = 0;
-    az.refresh    = 0;
-    az.wait_count = 0;
     az.halt       = !(sample & SAMPLE_HALT_BIT);
+    az.data       = 0;
+    az.wait_count = 0;
+
+    if (!(sample & SAMPLE_M1_BIT)) {
+        // /M1 low — M1 cycle or interrupt acknowledge
+        if (!(sample & SAMPLE_MREQ_BIT)) {
+            // /M1 low + /MREQ low → OPCODE FETCH (§4.1)
+            if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+                az.state = ST_M1_WAIT;
+            } else {
+                az.state = ST_M1_T3;
+            }
+        } else {
+            // /M1 low + /MREQ high → INTERRUPT ACKNOWLEDGE (§4.6)
+            // Two automatic wait states always present
+            az.state = ST_IA_TW1;
+        }
+    } else {
+        // /M1 high — memory or I/O cycle
+        if (!(sample & SAMPLE_MREQ_BIT)) {
+            // /MREQ low → memory cycle
+            if (!(sample & SAMPLE_RD_BIT)) {
+                // MEMORY READ (§4.2)
+                if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+                    az.state = ST_MR_WAIT;
+                } else {
+                    az.state = ST_MR_T3;
+                }
+            } else if (!(sample & SAMPLE_WR_BIT)) {
+                // MEMORY WRITE (§4.3) — data captured at T2↑
+                az.data = sample_data(sample);
+                if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+                    az.state = ST_MW_WAIT;
+                } else {
+                    az.state = ST_MW_T3;
+                }
+            } else {
+                // /MREQ low but no /RD or /WR — spurious, ignore
+                az.state = ST_IDLE;
+            }
+        } else if (!(sample & SAMPLE_IORQ_BIT)) {
+            // /IORQ low → I/O cycle (always has 1 automatic wait)
+            if (!(sample & SAMPLE_RD_BIT)) {
+                // I/O READ (§4.4) — auto TW* always present
+                az.state = ST_IR_TW;
+            } else if (!(sample & SAMPLE_WR_BIT)) {
+                // I/O WRITE (§4.5) — data captured at T2↑, auto TW*
+                az.data = sample_data(sample);
+                az.state = ST_IW_TW;
+            } else {
+                az.state = ST_IDLE;
+            }
+        } else {
+            // No control signals active — internal operation or T1↑
+            az.state = ST_IDLE;
+        }
+    }
 }
 
-// ---- Process one PIO sample ----
-// Each state extracts only the signals it needs (lazy extraction).
-// Uses computed goto (GCC extension) for dispatch — eliminates the
-// range-check overhead of a switch statement, saving ~1.5 cycles/sample.
-// /RESET is checked in IDLE state only (once per bus cycle) instead of
-// on every rising edge, saving ~2 cycles/sample.
-
-// ---- Process one PIO sample ----
-// Each state extracts only the signals it needs (lazy extraction).
-// /RESET is only checked in IDLE state (once per bus cycle) to reduce
-// per-sample overhead.  Z80 /RESET is held for many clocks, so this is safe.
+// ---- Process one rising-edge PIO sample ----
+// Every call corresponds to exactly one CLK rising edge.
+// No CLK bit checking needed — PIO guarantees rising-edge sampling.
 
 static void __always_inline process_sample(uint32_t sample) {
 
     switch (az.state) {
 
     // ================================================================
-    // IDLE — waiting for T1 rising edge
+    // SYNC — initial synchronization
     // ================================================================
-    case ST_IDLE:
-        if (!(sample & SAMPLE_CLK_BIT)) return;
-        // Check /RESET once per bus cycle (between cycles, in IDLE)
+    // Tests every rising edge for the unambiguous M1 fetch T2↑ signature
+    // (/M1 low + /MREQ low).  This combination cannot appear at T1↑
+    // (where /MREQ has not yet asserted) or at T3↑+ (where /MREQ is
+    // deasserting).
+    case ST_SYNC:
         if (__builtin_expect(!(sio_hw->gpio_hi_in & HI_RESET_BIT), 0)) {
             az.state = ST_RESET;
-            return;
+            break;
         }
-        if (!(sample & SAMPLE_M1_BIT)) {
-            begin_cycle(sample);
-            az.state = ST_T1_M1;
-            az.syncing = false;
-        } else if (!az.syncing) {
-            begin_cycle(sample);
-            az.state = ST_T1_NONM1;
+        if (!(sample & SAMPLE_M1_BIT) && !(sample & SAMPLE_MREQ_BIT)) {
+            // M1 fetch T2↑ found — sync achieved
+            az.address    = sample_addr(sample);
+            az.halt       = !(sample & SAMPLE_HALT_BIT);
+            az.data       = 0;
+            az.wait_count = 0;
+            if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+                az.state = ST_M1_WAIT;
+            } else {
+                az.state = ST_M1_T3;
+            }
         }
+        // Else: stay in ST_SYNC, try next edge
         break;
 
     // ================================================================
-    // RESET
+    // IDLE — between cycles, nominally T1↑
+    // ================================================================
+    case ST_IDLE:
+        // Check /RESET (once per bus cycle is sufficient —
+        // /RESET is held for many clocks per Z80 spec)
+        if (__builtin_expect(!(sio_hw->gpio_hi_in & HI_RESET_BIT), 0)) {
+            az.state = ST_RESET;
+            break;
+        }
+        // Phase recovery: if /MREQ or /IORQ is already active, this
+        // edge is actually T2↑ (happens after odd-count internal
+        // operations).  Go directly to discrimination.
+        if (!(sample & SAMPLE_MREQ_BIT) || !(sample & SAMPLE_IORQ_BIT)) {
+            discriminate_t2(sample);
+            break;
+        }
+        // Normal path: this is T1↑, advance to START for T2↑
+        az.state = ST_START;
+        break;
+
+    // ================================================================
+    // START — cycle type discrimination at T2↑
+    // ================================================================
+    case ST_START:
+        discriminate_t2(sample);
+        break;
+
+    // ================================================================
+    // RESET — §4.10
     // ================================================================
     case ST_RESET:
-        // Wait for /RESET to release (checked on both edges for responsiveness)
-        if (!(sio_hw->gpio_hi_in & HI_RESET_BIT)) return;  // still in reset
-        az.address = 0; az.data = 0; az.refresh = 0;
-        az.wait_count = 0; az.halt = false;
+        // Wait for /RESET to release
+        if (!(sio_hw->gpio_hi_in & HI_RESET_BIT)) break;  // still in reset
+        az.address = 0;
+        az.data = 0;
+        az.wait_count = 0;
+        az.halt = false;
         az.nmi_prev = !(sio_hw->gpio_hi_in & HI_NMI_BIT);
         az.nmi_pending = false;
         az.int_pending = false;
         emit_record(CYCLE_RESET);
-        az.state = ST_IDLE;
-        az.syncing = true;
-        break;
-
-    // ================================================================
-    // T1 — cycle type discrimination at falling edge
-    // ================================================================
-    case ST_T1_M1:
-        if (sample & SAMPLE_CLK_BIT) return;
-        if (!(sample & SAMPLE_MREQ_BIT)) {
-            az.state = ST_M1_T2R;
-        } else {
-            az.wait_count = 2;
-            az.state = ST_IA_T2R;
-        }
-        break;
-
-    case ST_T1_NONM1:
-        if (sample & SAMPLE_CLK_BIT) return;
-        if (!(sample & SAMPLE_MREQ_BIT)) {
-            az.state = (!(sample & SAMPLE_RD_BIT)) ? ST_MR_T2R : ST_MW_T2R;
-        } else {
-            az.state = ST_IO_T2R;
-        }
+        az.state = ST_SYNC;  // re-sync after reset
         break;
 
     // ================================================================
     // M1 OPCODE FETCH — §4.1
     // ================================================================
-    case ST_M1_T2R:
-        if (!(sample & SAMPLE_CLK_BIT)) return;
-        az.state = ST_M1_T2F;
-        break;
-
-    case ST_M1_T2F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+    case ST_M1_WAIT:    // TW↑ — wait state
         az.wait_count++;
-        az.state = ST_M1_TWR;
-    } else {
-        az.state = ST_M1_T3R;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+            // /WAIT still asserted — another TW
+        } else {
+            az.state = ST_M1_T3;
+        }
+        break;
+
+    case ST_M1_T3:      // T3↑ — capture opcode
+        az.data = sample_data(sample);
+        az.state = ST_M1_T4;
+        break;
+
+    case ST_M1_T4: {    // T4↑ — sample interrupts, emit record
+        uint32_t hi = sio_hw->gpio_hi_in;
+        bool nmi = !(hi & HI_NMI_BIT);
+        if (nmi && !az.nmi_prev) az.nmi_pending = true;
+        az.nmi_prev = nmi;
+        az.int_pending = !(hi & HI_INT_BIT);
+        emit_record(CYCLE_M1_FETCH);
+        az.state = ST_IDLE;
+        break;
     }
-        break;
-
-    case ST_M1_TWR:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_M1_TWF;
-        break;
-
-    case ST_M1_TWF:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
-        az.wait_count++;
-        az.state = ST_M1_TWR;
-    } else {
-        az.state = ST_M1_T3R;
-    }
-        break;
-
-    case ST_M1_T3R:     // capture opcode
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.data = sample_data(sample);
-    az.state = ST_M1_T3F;
-        break;
-
-    case ST_M1_T3F:     // capture refresh address
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.refresh = sample_addr(sample) & 0x7F;
-    az.state = ST_M1_T4R;
-        break;
-
-    case ST_M1_T4R: {   // sample interrupts, emit
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    uint32_t hi = sio_hw->gpio_hi_in;
-    bool nmi = !(hi & HI_NMI_BIT);
-    if (nmi && !az.nmi_prev) az.nmi_pending = true;
-    az.nmi_prev = nmi;
-    az.int_pending = !(hi & HI_INT_BIT);
-    emit_record(CYCLE_M1_FETCH);
-    az.state = ST_IDLE;
-        break;
-}
 
     // ================================================================
     // MEMORY READ — §4.2
     // ================================================================
-    case ST_MR_T2R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_MR_T2F;
-        break;
-
-    case ST_MR_T2F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+    case ST_MR_WAIT:    // TW↑ — wait state
         az.wait_count++;
-        az.state = ST_MR_TWR;
-    } else {
-        az.state = ST_MR_T3R;
-    }
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+            // /WAIT still asserted
+        } else {
+            az.state = ST_MR_T3;
+        }
         break;
 
-    case ST_MR_TWR:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_MR_TWF;
-        break;
-
-    case ST_MR_TWF:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
-        az.wait_count++;
-        az.state = ST_MR_TWR;
-    } else {
-        az.state = ST_MR_T3R;
-    }
-        break;
-
-    case ST_MR_T3R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_MR_T3F;
-        break;
-
-    case ST_MR_T3F:     // capture read data
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.data = sample_data(sample);
-    emit_record(CYCLE_MEM_READ);
-    az.state = ST_IDLE;
+    case ST_MR_T3:      // T3↑ — capture data, emit
+        az.data = sample_data(sample);
+        emit_record(CYCLE_MEM_READ);
+        az.state = ST_IDLE;
         break;
 
     // ================================================================
     // MEMORY WRITE — §4.3
     // ================================================================
-    case ST_MW_T2R:     // capture write data
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.data = sample_data(sample);
-    az.state = ST_MW_T2F;
-        break;
-
-    case ST_MW_T2F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+    case ST_MW_WAIT:    // TW↑ — wait state (data already captured at T2↑)
         az.wait_count++;
-        az.state = ST_MW_TWR;
-    } else {
-        az.state = ST_MW_T3R;
-    }
-        break;
-
-    case ST_MW_TWR:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_MW_TWF;
-        break;
-
-    case ST_MW_TWF:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
-        az.wait_count++;
-        az.state = ST_MW_TWR;
-    } else {
-        az.state = ST_MW_T3R;
-    }
-        break;
-
-    case ST_MW_T3R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_MW_T3F;
-        break;
-
-    case ST_MW_T3F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    emit_record(CYCLE_MEM_WRITE);
-    az.state = ST_IDLE;
-        break;
-
-    // ================================================================
-    // I/O PENDING — wait for T2↑ to confirm I/O type
-    // ================================================================
-    case ST_IO_T2R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    if (!(sample & SAMPLE_IORQ_BIT)) {
-        if (!(sample & SAMPLE_RD_BIT)) {
-            az.wait_count = 1;
-            az.state = ST_IR_T2F;
-        } else if (!(sample & SAMPLE_WR_BIT)) {
-            az.data = sample_data(sample);
-            az.wait_count = 1;
-            az.state = ST_IW_T2F;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+            // /WAIT still asserted
         } else {
-            begin_cycle(sample);
-            az.state = ST_T1_NONM1;
+            az.state = ST_MW_T3;
         }
-    } else {
-        // Not I/O — internal operation. Re-interpret as T1↑.
-        if (!(sample & SAMPLE_M1_BIT)) {
-            begin_cycle(sample);
-            az.state = ST_T1_M1;
-        } else {
-            begin_cycle(sample);
-            az.state = ST_T1_NONM1;
-        }
-    }
+        break;
+
+    case ST_MW_T3:      // T3↑ — emit (data was captured at T2↑)
+        emit_record(CYCLE_MEM_WRITE);
+        az.state = ST_IDLE;
         break;
 
     // ================================================================
     // I/O READ — §4.4
     // ================================================================
-    case ST_IR_T2F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.state = ST_IR_TWR;
-        break;
-
-    case ST_IR_TWR:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IR_TWF;
-        break;
-
-    case ST_IR_TWF:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+    case ST_IR_TW:      // TW*↑ (auto-wait) + additional waits
         az.wait_count++;
-        az.state = ST_IR_TWR;
-    } else {
-        az.state = ST_IR_T3R;
-    }
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+            // /WAIT asserted — additional wait state
+        } else {
+            az.state = ST_IR_T3;
+        }
         break;
 
-    case ST_IR_T3R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IR_T3F;
-        break;
-
-    case ST_IR_T3F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.data = sample_data(sample);
-    emit_record(CYCLE_IO_READ);
-    az.state = ST_IDLE;
+    case ST_IR_T3:      // T3↑ — capture data, emit
+        az.data = sample_data(sample);
+        emit_record(CYCLE_IO_READ);
+        az.state = ST_IDLE;
         break;
 
     // ================================================================
     // I/O WRITE — §4.5
     // ================================================================
-    case ST_IW_T2F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.state = ST_IW_TWR;
-        break;
-
-    case ST_IW_TWR:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IW_TWF;
-        break;
-
-    case ST_IW_TWF:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+    case ST_IW_TW:      // TW*↑ (auto-wait) + additional waits
         az.wait_count++;
-        az.state = ST_IW_TWR;
-    } else {
-        az.state = ST_IW_T3R;
-    }
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+            // /WAIT asserted — additional wait state
+        } else {
+            az.state = ST_IW_T3;
+        }
         break;
 
-    case ST_IW_T3R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IW_T3F;
-        break;
-
-    case ST_IW_T3F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    emit_record(CYCLE_IO_WRITE);
-    az.state = ST_IDLE;
+    case ST_IW_T3:      // T3↑ — emit (data was captured at T2↑)
+        emit_record(CYCLE_IO_WRITE);
+        az.state = ST_IDLE;
         break;
 
     // ================================================================
     // INTERRUPT ACKNOWLEDGE — §4.6
     // ================================================================
-    case ST_IA_T2R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IA_T2F;
-        break;
-
-    case ST_IA_T2F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.state = ST_IA_TW1R;
-        break;
-
-    case ST_IA_TW1R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IA_TW1F;
-        break;
-
-    case ST_IA_TW1F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.state = ST_IA_TW2R;
-        break;
-
-    case ST_IA_TW2R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IA_TW2F;
-        break;
-
-    case ST_IA_TW2F:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+    case ST_IA_TW1:     // TW1*↑ — first auto-wait (unconditional)
         az.wait_count++;
-        az.state = ST_IA_TWR;
-    } else {
-        az.state = ST_IA_T3R;
-    }
+        az.state = ST_IA_TW2;
         break;
 
-    case ST_IA_TWR:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IA_TWF;
-        break;
-
-    case ST_IA_TWF:
-    if (sample & SAMPLE_CLK_BIT) return;
-    if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+    case ST_IA_TW2:     // TW2*↑ — second auto-wait, /WAIT check
         az.wait_count++;
-        az.state = ST_IA_TWR;
-    } else {
-        az.state = ST_IA_T3R;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+            az.state = ST_IA_TW;
+        } else {
+            az.state = ST_IA_T3;
+        }
+        break;
+
+    case ST_IA_TW:      // TW↑ — additional wait states
+        az.wait_count++;
+        if (!(sio_hw->gpio_hi_in & HI_WAIT_BIT)) {
+            // /WAIT still asserted
+        } else {
+            az.state = ST_IA_T3;
+        }
+        break;
+
+    case ST_IA_T3:      // T3↑ — capture interrupt vector
+        az.data = sample_data(sample);
+        az.state = ST_IA_T4;
+        break;
+
+    case ST_IA_T4: {    // T4↑ — emit record
+        uint32_t hi = sio_hw->gpio_hi_in;
+        bool nmi = !(hi & HI_NMI_BIT);
+        if (nmi && !az.nmi_prev) az.nmi_pending = true;
+        az.nmi_prev = nmi;
+        az.int_pending = !(hi & HI_INT_BIT);
+        emit_record(CYCLE_INT_ACK);
+        az.state = ST_IDLE;
+        break;
     }
-        break;
-
-    case ST_IA_T3R:
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    az.state = ST_IA_T3F;
-        break;
-
-    case ST_IA_T3F:     // capture interrupt vector
-    if (sample & SAMPLE_CLK_BIT) return;
-    az.data = sample_data(sample);
-    az.state = ST_IA_T4R;
-        break;
-
-    case ST_IA_T4R: {   // refresh done, emit
-    if (!(sample & SAMPLE_CLK_BIT)) return;
-    uint32_t hi = sio_hw->gpio_hi_in;
-    bool nmi = !(hi & HI_NMI_BIT);
-    if (nmi && !az.nmi_prev) az.nmi_pending = true;
-    az.nmi_prev = nmi;
-    az.int_pending = !(hi & HI_INT_BIT);
-    emit_record(CYCLE_INT_ACK);
-    az.state = ST_IDLE;
-        break;
-}
 
     } // switch
 }
@@ -721,8 +572,7 @@ static void __not_in_flash_func(core1_main)(void) {
     uint32_t sample_count = 0;
 
     memset(&az, 0, sizeof(az));
-    az.state = ST_IDLE;
-    az.syncing = true;
+    az.state = ST_SYNC;
     stage_wr = 0;
     stage_rd = 0;
 
@@ -730,8 +580,7 @@ static void __not_in_flash_func(core1_main)(void) {
         if (needs_reset) {
             tail = dma_write_index();
             memset(&az, 0, sizeof(az));
-            az.state = ST_IDLE;
-            az.syncing = true;
+            az.state = ST_SYNC;
             stage_wr = 0;
             stage_rd = 0;
             sample_count = 0;
@@ -763,8 +612,7 @@ static void __not_in_flash_func(core1_main)(void) {
             && distance != 0) {
             diag_dma_overflows++;
             tail = head;
-            az.state = ST_IDLE;
-            az.syncing = true;
+            az.state = ST_SYNC;
         }
 
         // Process PIO samples with interleaved PSRAM drain.
@@ -946,8 +794,7 @@ static void trigger_eval(void) {
         rec.address    = src->address;
         rec.data       = src->data;
         rec.cycle_type = src->cycle_type;
-        rec.refresh    = src->refresh;
-        rec.wait_count = src->wait_count;
+                rec.wait_count = src->wait_count;
         rec.flags      = src->flags;
         rec.seq        = src->seq;
 
@@ -1100,7 +947,6 @@ static void cmd_read_buffer(void) {
         rec.address    = src->address;
         rec.data       = src->data;
         rec.cycle_type = src->cycle_type;
-        rec.refresh    = src->refresh;
         rec.wait_count = src->wait_count;
         rec.flags      = src->flags;
         rec.seq        = src->seq;
