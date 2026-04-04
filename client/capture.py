@@ -53,10 +53,11 @@ DIAG_SKIP_BOTH     = 0x03
 READOUT_MAGIC      = 0x5A383054  # "Z80T"
 STATUS_MAGIC       = 0x53544154  # "STAT"
 
-# trace_record_t layout: 7 bytes
-# address(u16), data(u8), cycle_type(u8), wait_count(u8), flags(u8), seq(u8)
-RECORD_FMT = '<HBBBBB'
-RECORD_SIZE = struct.calcsize(RECORD_FMT)  # 7
+# trace_record_t layout: 4 bytes
+# address(u16), data(u8), type_wait_flags(u8)
+# type_wait_flags packing: [cycle_type:3 | wait_count:3 | halt:1 | int:1]
+RECORD_FMT = '<HBB'
+RECORD_SIZE = struct.calcsize(RECORD_FMT)  # 4
 
 # Cycle type names (matches cycle_type_t enum)
 CYCLE_NAMES = {
@@ -191,17 +192,26 @@ def read_buffer(ser, pre_count, post_count=0, progress=True):
     return records, trig_off
 
 
+def unpack_type_wait_flags(packed):
+    """Unpack the type_wait_flags byte into (cycle_type, wait_count, halt, int)."""
+    cycle_type = (packed >> 5) & 0x7
+    wait_count = (packed >> 2) & 0x7
+    halt = bool(packed & 0x2)
+    intr = bool(packed & 0x1)
+    return cycle_type, wait_count, halt, intr
+
+
 def format_record(rec):
     """Format a single trace record for display."""
-    address, data, cycle_type, wait_count, flags, seq = rec
+    address, data, packed = rec
+    cycle_type, wait_count, halt, intr = unpack_type_wait_flags(packed)
     name = CYCLE_NAMES.get(cycle_type, f'?{cycle_type}')
     parts = [f"  {name:6s} {address:04X} {data:02X}"]
     if wait_count > 0:
         parts.append(f" W={wait_count}")
     flag_strs = []
-    if flags & 1: flag_strs.append('HALT')
-    if flags & 2: flag_strs.append('INT')
-    if flags & 4: flag_strs.append('NMI')
+    if halt: flag_strs.append('HALT')
+    if intr: flag_strs.append('INT')
     if flag_strs:
         parts.append(f" [{','.join(flag_strs)}]")
     return ''.join(parts)

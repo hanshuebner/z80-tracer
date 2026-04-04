@@ -20,9 +20,22 @@ MWRITE = 2
 IOREAD = 3
 IOWRITE = 4
 
+# Matches trace_record_t: 4 bytes per record
+# Byte 0-1: address (u16 LE)
+# Byte 2:   data (u8)
+# Byte 3:   cycle_type:3 | wait_count:3 | halt:1 | int:1
+RECORD_FMT = '<HBB'
+
+
+def pack_type_wait_flags(cycle_type, wait_count=0, halt=False, intr=False):
+    return ((cycle_type & 0x7) << 5 |
+            (wait_count & 0x7) << 2 |
+            (0x2 if halt else 0) |
+            (0x1 if intr else 0))
+
 
 class Z80BusGen:
-    """Generates trace packets matching real Z80 bus behaviour."""
+    """Generates 4-byte trace records matching trace_record_t format."""
 
     def __init__(self):
         self.packets = bytearray()
@@ -30,11 +43,8 @@ class Z80BusGen:
         self.sp = 0  # track SP for push/pop/call/ret generation
 
     def _pkt(self, cycle_type, addr, data, wait_count=0, halt=False):
-        self.packets.append(0x80 | ((cycle_type & 0x0F) << 3) | ((addr >> 13) & 0x07))
-        self.packets.append((addr >> 6) & 0x7F)
-        self.packets.append(((addr & 0x3F) << 1) | ((data >> 7) & 0x01))
-        self.packets.append(data & 0x7F)
-        self.packets.append((0x40 if halt else 0) | (wait_count & 0x3F))
+        packed = pack_type_wait_flags(cycle_type, wait_count, halt)
+        self.packets.extend(struct.pack(RECORD_FMT, addr & 0xFFFF, data & 0xFF, packed))
 
     def fetch(self, opcode, addr=None):
         """Opcode fetch (M1 cycle)."""
@@ -455,7 +465,7 @@ def main():
     data = generate()
     sys.stdout.buffer.write(data)
     sys.stderr.write(f"Generated {len(data)} bytes "
-                     f"({len(data) // 5} bus cycles)\n")
+                     f"({len(data) // 4} bus cycles)\n")
 
 
 if __name__ == "__main__":

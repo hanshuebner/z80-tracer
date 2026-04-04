@@ -173,18 +173,12 @@ static struct {
     uint8_t  wait_count;
     bool     halt;
 
-    // Interrupt edge detection (sampled at M1/INTACK T4↑)
-    bool     nmi_prev;
-    bool     nmi_pending;
+    // /INT level (sampled at M1/INTACK T4↑)
     bool     int_pending;
-
-    // Sequence counter for gap detection (7-bit, wraps)
-    uint8_t  seq;
 } az;
 
 #define HI_WAIT_BIT   (1u << (PIN_WAIT  - 32))
 #define HI_INT_BIT    (1u << (PIN_INT   - 32))
-#define HI_NMI_BIT    (1u << (PIN_NMI   - 32))
 #define HI_RESET_BIT  (1u << (PIN_RESET - 32))
 
 // ---- SRAM staging buffer (core 1 → PSRAM) ----
@@ -202,18 +196,11 @@ static uint32_t stage_rd;  // read by stage_drain_one (core 1 only)
 
 static void __always_inline emit_record(uint8_t cycle_type) {
     trace_record_t *dst = &stage_buf[stage_wr & STAGE_BUF_MASK];
-    dst->address    = az.address;
-    dst->data       = az.data;
-    dst->cycle_type = cycle_type;
-    dst->wait_count = az.wait_count;
-    dst->flags      = 0;
-    dst->seq        = az.seq++ & 0x7F;
-    if (az.halt)        dst->flags |= TRACE_FLAG_HALT;
-    if (az.int_pending) dst->flags |= TRACE_FLAG_INT;
-    if (az.nmi_pending) dst->flags |= TRACE_FLAG_NMI;
-
+    dst->address         = az.address;
+    dst->data            = az.data;
+    dst->type_wait_flags = trace_pack(cycle_type, az.wait_count,
+                                      az.halt, az.int_pending);
     stage_wr++;
-    az.nmi_pending = false;
 }
 
 // Drain one staged record to PSRAM (amortized: ~42 cycles every few samples)
@@ -376,8 +363,6 @@ static void __always_inline process_sample(uint32_t sample) {
         az.data = 0;
         az.wait_count = 0;
         az.halt = false;
-        az.nmi_prev = !(sio_hw->gpio_hi_in & HI_NMI_BIT);
-        az.nmi_pending = false;
         az.int_pending = false;
         emit_record(CYCLE_RESET);
         az.state = ST_SYNC;  // re-sync after reset
@@ -400,12 +385,8 @@ static void __always_inline process_sample(uint32_t sample) {
         az.state = ST_M1_T4;
         break;
 
-    case ST_M1_T4: {    // T4↑ — sample interrupts, emit record
-        uint32_t hi = sio_hw->gpio_hi_in;
-        bool nmi = !(hi & HI_NMI_BIT);
-        if (nmi && !az.nmi_prev) az.nmi_pending = true;
-        az.nmi_prev = nmi;
-        az.int_pending = !(hi & HI_INT_BIT);
+    case ST_M1_T4: {    // T4↑ — sample /INT, emit record
+        az.int_pending = !(sio_hw->gpio_hi_in & HI_INT_BIT);
         emit_record(CYCLE_M1_FETCH);
         az.state = ST_IDLE;
         break;
@@ -513,11 +494,7 @@ static void __always_inline process_sample(uint32_t sample) {
         break;
 
     case ST_IA_T4: {    // T4↑ — emit record
-        uint32_t hi = sio_hw->gpio_hi_in;
-        bool nmi = !(hi & HI_NMI_BIT);
-        if (nmi && !az.nmi_prev) az.nmi_pending = true;
-        az.nmi_prev = nmi;
-        az.int_pending = !(hi & HI_INT_BIT);
+        az.int_pending = !(sio_hw->gpio_hi_in & HI_INT_BIT);
         emit_record(CYCLE_INT_ACK);
         az.state = ST_IDLE;
         break;
@@ -736,38 +713,39 @@ static uint32_t trigger_chase_idx;    // core 0's read position chasing core 1
 
 // Check one record against all configured triggers
 static bool check_triggers(const trace_record_t *rec) {
+    uint8_t ct = trace_cycle_type(rec->type_wait_flags);
     for (uint32_t i = 0; i < trigger_count; i++) {
         const trigger_t *t = &triggers[i];
         bool match = false;
 
         switch (t->type) {
         case TRIG_PC_MATCH:
-            if (rec->cycle_type == CYCLE_M1_FETCH &&
+            if (ct == CYCLE_M1_FETCH &&
                 rec->address >= t->addr_lo && rec->address <= t->addr_hi)
                 match = true;
             break;
         case TRIG_MEM_READ:
-            if (rec->cycle_type == CYCLE_MEM_READ &&
+            if (ct == CYCLE_MEM_READ &&
                 rec->address >= t->addr_lo && rec->address <= t->addr_hi)
                 match = true;
             break;
         case TRIG_MEM_WRITE:
-            if (rec->cycle_type == CYCLE_MEM_WRITE &&
+            if (ct == CYCLE_MEM_WRITE &&
                 rec->address >= t->addr_lo && rec->address <= t->addr_hi)
                 match = true;
             break;
         case TRIG_IO_READ:
-            if (rec->cycle_type == CYCLE_IO_READ &&
+            if (ct == CYCLE_IO_READ &&
                 rec->address >= t->addr_lo && rec->address <= t->addr_hi)
                 match = true;
             break;
         case TRIG_IO_WRITE:
-            if (rec->cycle_type == CYCLE_IO_WRITE &&
+            if (ct == CYCLE_IO_WRITE &&
                 rec->address >= t->addr_lo && rec->address <= t->addr_hi)
                 match = true;
             break;
         case TRIG_INT_ACK:
-            if (rec->cycle_type == CYCLE_INT_ACK)
+            if (ct == CYCLE_INT_ACK)
                 match = true;
             break;
         }
@@ -791,12 +769,9 @@ static void trigger_eval(void) {
         // Read from uncached PSRAM
         const volatile trace_record_t *src = &psram_ring[idx];
         trace_record_t rec;
-        rec.address    = src->address;
-        rec.data       = src->data;
-        rec.cycle_type = src->cycle_type;
-                rec.wait_count = src->wait_count;
-        rec.flags      = src->flags;
-        rec.seq        = src->seq;
+        rec.address         = src->address;
+        rec.data            = src->data;
+        rec.type_wait_flags = src->type_wait_flags;
 
         if (cap_state == CAP_ARMED) {
             if (check_triggers(&rec)) {
@@ -944,12 +919,9 @@ static void cmd_read_buffer(void) {
         uint32_t idx = (start_idx + i) & PSRAM_RING_MASK;
         trace_record_t rec;
         const volatile trace_record_t *src = &psram_ring[idx];
-        rec.address    = src->address;
-        rec.data       = src->data;
-        rec.cycle_type = src->cycle_type;
-        rec.wait_count = src->wait_count;
-        rec.flags      = src->flags;
-        rec.seq        = src->seq;
+        rec.address         = src->address;
+        rec.data            = src->data;
+        rec.type_wait_flags = src->type_wait_flags;
         usb_write_bytes(&rec, sizeof(rec));
     }
 

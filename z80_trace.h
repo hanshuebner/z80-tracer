@@ -74,20 +74,52 @@ typedef enum {
 } cycle_type_t;
 
 // Trace record produced by analyzer state machine (core 1 → PSRAM ring buffer)
+// 4 bytes per record — fits 2M records in 8 MB PSRAM.
+//
+// Byte 3 packing:  [ cycle_type:3 | wait_count:3 | halt:1 | int:1 ]
+//   Bits 7-5: cycle_type (0-6)
+//   Bits 4-2: wait_count (0-7, includes auto-waits for I/O/INT)
+//   Bit  1:   halt (/HALT was active)
+//   Bit  0:   int  (/INT was active at end of M1/INTACK cycle)
 typedef struct {
     uint16_t address;       // A[15:0] captured at T2↑
     uint8_t  data;          // D[7:0] — sample point depends on cycle type:
                             //   M1_FETCH: T3↑, MEM_RD: T3↑, MEM_WR: T2↑,
                             //   IO_RD: T3↑, IO_WR: T2↑, INT_ACK: T3↑
-    uint8_t  cycle_type;    // cycle_type_t
-    uint8_t  wait_count;    // number of wait states (includes auto-waits for I/O/INT)
-    uint8_t  flags;         // TRACE_FLAG_*
-    uint8_t  seq;           // Sequence counter (7-bit, wraps), for gap detection
+    uint8_t  type_wait_flags; // packed: see above
 } trace_record_t;
 
-#define TRACE_FLAG_HALT  (1u << 0)  // CPU is halted
-#define TRACE_FLAG_INT   (1u << 1)  // /INT was active at end of cycle
-#define TRACE_FLAG_NMI   (1u << 2)  // /NMI falling edge detected
+// Packed byte field positions
+#define TRACE_TYPE_SHIFT    5
+#define TRACE_TYPE_MASK     (0x7u << TRACE_TYPE_SHIFT)
+#define TRACE_WAIT_SHIFT    2
+#define TRACE_WAIT_MASK     (0x7u << TRACE_WAIT_SHIFT)
+#define TRACE_HALT_BIT      (1u << 1)
+#define TRACE_INT_BIT       (1u << 0)
+
+static inline uint8_t trace_pack(uint8_t cycle_type, uint8_t wait_count,
+                                  bool halt, bool intr) {
+    return (uint8_t)((cycle_type << TRACE_TYPE_SHIFT) |
+                     ((wait_count & 0x7) << TRACE_WAIT_SHIFT) |
+                     (halt ? TRACE_HALT_BIT : 0) |
+                     (intr ? TRACE_INT_BIT : 0));
+}
+
+static inline uint8_t trace_cycle_type(uint8_t packed) {
+    return (packed & TRACE_TYPE_MASK) >> TRACE_TYPE_SHIFT;
+}
+
+static inline uint8_t trace_wait_count(uint8_t packed) {
+    return (packed & TRACE_WAIT_MASK) >> TRACE_WAIT_SHIFT;
+}
+
+static inline bool trace_halt(uint8_t packed) {
+    return packed & TRACE_HALT_BIT;
+}
+
+static inline bool trace_int(uint8_t packed) {
+    return packed & TRACE_INT_BIT;
+}
 
 // --- Helpers ---
 
@@ -106,9 +138,8 @@ static inline uint8_t sample_data(uint32_t sample) {
 #define CAPTURE_BUF_SIZE_WORDS  (CAPTURE_BUF_SIZE_BYTES / sizeof(uint32_t))
 
 // --- PSRAM trace ring buffer ---
-// 8 MB PSRAM / 7 bytes per record ≈ 1.19M records
-// Use power-of-2 count for masking (1M records = 7 MB used)
-#define PSRAM_RING_RECORDS      (1u << 20)    // 1,048,576 records
+// 8 MB PSRAM / 4 bytes per record = 2M records (exact fit)
+#define PSRAM_RING_RECORDS      (1u << 21)    // 2,097,152 records
 #define PSRAM_RING_MASK         (PSRAM_RING_RECORDS - 1)
 
 // --- Binary command protocol (host → firmware) ---
