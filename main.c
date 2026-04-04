@@ -13,13 +13,25 @@
 #include "z80_trace.pio.h"
 #include "psram.h"
 
-// ---- ARM DWT Cycle Counter (Cortex-M33) ----
-// Direct register access — avoids header dependency on CMSIS.
-#define DWT_CTRL_REG    (*(volatile uint32_t *)0xE0001000)
-#define DWT_CYCCNT_REG  (*(volatile uint32_t *)0xE0001004)
-#define DEMCR_REG       (*(volatile uint32_t *)0xE000EDF0)
-#define DEMCR_TRCENA    (1u << 24)
-#define DWT_CYCCNTENA   (1u << 0)
+// ---- Cycle counter via SysTick (Cortex-M33) ----
+// RP2350's Cortex-M33 does not implement DWT CYCCNT.
+// SysTick counts down at CPU clock rate with a 24-bit counter.
+#define SYST_CSR   (*(volatile uint32_t *)0xE000E010)
+#define SYST_RVR   (*(volatile uint32_t *)0xE000E014)
+#define SYST_CVR   (*(volatile uint32_t *)0xE000E018)
+#define SYST_CSR_ENABLE    (1u << 0)
+#define SYST_CSR_CLKSOURCE (1u << 2)  // 1 = processor clock
+#define SYST_RELOAD_MAX    0x00FFFFFFu  // 24-bit max
+
+static inline uint32_t cycle_count(void) {
+    // SysTick counts DOWN, so invert to get an increasing count
+    return SYST_RELOAD_MAX - SYST_CVR;
+}
+
+// Elapsed cycles between two cycle_count() readings, handling 24-bit wrap.
+static inline uint32_t cycle_elapsed(uint32_t t0, uint32_t t1) {
+    return (t1 - t0) & SYST_RELOAD_MAX;
+}
 
 // Poll timeout: 600 ARM cycles (~2 µs at 300 MHz).
 // Handles Z80 clocks down to ~0.5 MHz; catches stuck CLK.
@@ -294,9 +306,9 @@ static void emit_data_loss(uint8_t cause, uint16_t lost_count) {
 // Poll for CLK falling edge, return true if /WAIT is active (low).
 // Returns false (no wait) on timeout.
 static bool __always_inline poll_wait(void) {
-    uint32_t t0 = DWT_CYCCNT_REG;
+    uint32_t t0 = cycle_count();
     while (sio_hw->gpio_in & (1u << PIN_CLK)) {
-        if (__builtin_expect((DWT_CYCCNT_REG - t0) > POLL_TIMEOUT_CYCLES, 0)) {
+        if (__builtin_expect(cycle_elapsed(t0, cycle_count()) > POLL_TIMEOUT_CYCLES, 0)) {
             perf_poll_timeouts++;
             return false;
         }
@@ -307,9 +319,9 @@ static bool __always_inline poll_wait(void) {
 // Poll for CLK falling edge, return GPIO 0-31 snapshot (bus state).
 // Returns 0 on timeout.
 static uint32_t __always_inline poll_bus(void) {
-    uint32_t t0 = DWT_CYCCNT_REG;
+    uint32_t t0 = cycle_count();
     while (sio_hw->gpio_in & (1u << PIN_CLK)) {
-        if (__builtin_expect((DWT_CYCCNT_REG - t0) > POLL_TIMEOUT_CYCLES, 0)) {
+        if (__builtin_expect(cycle_elapsed(t0, cycle_count()) > POLL_TIMEOUT_CYCLES, 0)) {
             perf_poll_timeouts++;
             return 0;
         }
@@ -655,10 +667,10 @@ static volatile uint32_t diag_total_samples;       // total PIO samples processe
 static volatile uint32_t diag_wait_asserts;        // /WAIT assertion count
 
 static void __not_in_flash_func(core1_main)(void) {
-    // Enable DWT cycle counter for performance measurement
-    DEMCR_REG |= DEMCR_TRCENA;
-    DWT_CYCCNT_REG = 0;
-    DWT_CTRL_REG |= DWT_CYCCNTENA;
+    // Enable SysTick as free-running cycle counter (no interrupt).
+    SYST_RVR = SYST_RELOAD_MAX;
+    SYST_CVR = 0;
+    SYST_CSR = SYST_CSR_ENABLE | SYST_CSR_CLKSOURCE;
 
     uint32_t tail = 0;
     uint32_t sample_count = 0;
@@ -737,9 +749,9 @@ static void __not_in_flash_func(core1_main)(void) {
         } else if (mode & DIAG_SKIP_PSRAM) {
             // Mode 2: run state machine but discard records (no PSRAM writes)
             while (tail != head) {
-                uint32_t t0 = DWT_CYCCNT_REG;
+                uint32_t t0 = cycle_count();
                 process_sample(sample_buf[tail]);
-                uint32_t dt = DWT_CYCCNT_REG - t0;
+                uint32_t dt = cycle_elapsed(t0, cycle_count());
                 if (dt > perf_sample_max) perf_sample_max = dt;
                 if (dt < perf_sample_min) perf_sample_min = dt;
                 tail = (tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
@@ -750,9 +762,9 @@ static void __not_in_flash_func(core1_main)(void) {
         } else {
             // Normal mode: state machine + interleaved PSRAM drain
             while (tail != head) {
-                uint32_t t0 = DWT_CYCCNT_REG;
+                uint32_t t0 = cycle_count();
                 process_sample(sample_buf[tail]);
-                uint32_t dt = DWT_CYCCNT_REG - t0;
+                uint32_t dt = cycle_elapsed(t0, cycle_count());
                 if (dt > perf_sample_max) perf_sample_max = dt;
                 if (dt < perf_sample_min) perf_sample_min = dt;
                 tail = (tail + 1) & (CAPTURE_BUF_SIZE_WORDS - 1);
