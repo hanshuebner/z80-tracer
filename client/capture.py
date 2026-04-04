@@ -66,20 +66,6 @@ CYCLE_NAMES = {
     4: 'IOWRIT',
     5: 'INTACK',
     6: 'RESET',
-    7: 'DLOSS',
-}
-
-# Data loss cause codes (matches LOSS_* defines in z80_trace.h)
-LOSS_DMA_OVERFLOW     = 1
-LOSS_PIO_OVERFLOW     = 2
-LOSS_STAGING_OVERFLOW = 3
-LOSS_POLL_TIMEOUT     = 4
-
-LOSS_CAUSE_NAMES = {
-    LOSS_DMA_OVERFLOW: 'DMA_OVERFLOW',
-    LOSS_PIO_OVERFLOW: 'PIO_OVERFLOW',
-    LOSS_STAGING_OVERFLOW: 'STAGING_OVERFLOW',
-    LOSS_POLL_TIMEOUT: 'POLL_TIMEOUT',
 }
 
 
@@ -105,16 +91,13 @@ def read_exact(ser, n, timeout=10.0):
 
 
 def get_status(ser):
-    """Query firmware status. Returns dict with capture state, diagnostics, and perf."""
+    """Query firmware status. Returns dict with capture state and diagnostics."""
     send_cmd(ser, CMD_GET_STATUS)
-    raw = read_exact(ser, 68)  # 17 × uint32_t = 68 bytes
+    raw = read_exact(ser, 44)
     (magic, capture_state, write_idx, dma_overflows,
      max_dma_distance, max_stage_depth, total_samples,
      cpu_clock_khz, trigger_idx, trigger_count,
-     wait_asserts,
-     sample_max_cycles, sample_min_cycles,
-     pio_overflows, staging_overflows, poll_timeouts,
-     data_loss_records) = struct.unpack('<IIIIIIIIIIIIIIIII', raw)
+     wait_asserts) = struct.unpack('<IIIIIIIIIII', raw)
     if magic != STATUS_MAGIC:
         raise ValueError(f"Bad status magic: 0x{magic:08X} (expected 0x{STATUS_MAGIC:08X})")
     return {
@@ -130,14 +113,6 @@ def get_status(ser):
         'trigger_idx': trigger_idx,
         'trigger_count': trigger_count,
         'wait_asserts': wait_asserts,
-        # Performance measurement
-        'sample_max_cycles': sample_max_cycles,
-        'sample_min_cycles': sample_min_cycles if sample_min_cycles != 0xFFFFFFFF else None,
-        # Data loss counters
-        'pio_overflows': pio_overflows,
-        'staging_overflows': staging_overflows,
-        'poll_timeouts': poll_timeouts,
-        'data_loss_records': data_loss_records,
     }
 
 
@@ -219,11 +194,6 @@ def format_record(rec):
     """Format a single trace record for display."""
     address, data, cycle_type, refresh, wait_count, flags, seq = rec
     name = CYCLE_NAMES.get(cycle_type, f'?{cycle_type}')
-
-    if cycle_type == 7:  # DATA_LOSS
-        cause = LOSS_CAUSE_NAMES.get(data, f'UNKNOWN({data})')
-        return f"  *** DATA LOSS: {cause}, lost_count={address} ***"
-
     parts = [f"  {name:6s} {address:04X} {data:02X}"]
     if cycle_type == 0:  # M1 fetch
         parts.append(f" R={refresh:02X}")
@@ -236,50 +206,3 @@ def format_record(rec):
     if flag_strs:
         parts.append(f" [{','.join(flag_strs)}]")
     return ''.join(parts)
-
-
-def format_status(status):
-    """Format a status dict for display, including perf and data loss."""
-    cpu_mhz = status['cpu_clock_khz'] / 1000
-    lines = [
-        f"State: {status['capture_state_name']}, CPU: {cpu_mhz:.0f} MHz",
-        f"  Samples: {status['total_samples']:,}, Records: {status['write_idx']:,}",
-        f"  DMA backlog: {status['max_dma_distance']}/{CAPTURE_BUF_WORDS} "
-        f"({status['max_dma_distance']*100/CAPTURE_BUF_WORDS:.0f}%)",
-        f"  Stage depth: {status['max_stage_depth']}",
-        f"  /WAIT asserts: {status['wait_asserts']}",
-    ]
-
-    # Performance
-    max_c = status['sample_max_cycles']
-    min_c = status['sample_min_cycles']
-    if min_c is not None:
-        budget = 75  # cycles at 300 MHz / 4 MHz Z80
-        ok = "OK" if max_c <= budget else "OVER BUDGET"
-        lines.append(
-            f"  Cycles/sample: {min_c}–{max_c} (budget: {budget}) [{ok}]")
-    else:
-        lines.append("  Cycles/sample: (no samples)")
-
-    # Data loss
-    loss_total = (status['dma_overflows'] + status['pio_overflows']
-                  + status['staging_overflows'] + status['poll_timeouts'])
-    if loss_total > 0:
-        lines.append("  *** DATA LOSS ***")
-        if status['dma_overflows']:
-            lines.append(f"    DMA overflows:     {status['dma_overflows']}")
-        if status['pio_overflows']:
-            lines.append(f"    PIO overflows:     {status['pio_overflows']}")
-        if status['staging_overflows']:
-            lines.append(f"    Staging overflows: {status['staging_overflows']}")
-        if status['poll_timeouts']:
-            lines.append(f"    Poll timeouts:     {status['poll_timeouts']}")
-        lines.append(f"    Loss records:      {status['data_loss_records']}")
-    else:
-        lines.append("  Data loss: none")
-
-    return '\n'.join(lines)
-
-
-# DMA buffer size in words (must match CAPTURE_BUF_SIZE_WORDS in z80_trace.h)
-CAPTURE_BUF_WORDS = 1 << 15 >> 2  # 32KB / 4 = 8192

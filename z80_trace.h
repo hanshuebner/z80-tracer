@@ -71,14 +71,7 @@ typedef enum {
     CYCLE_IO_WRITE   = 4,   // I/O write
     CYCLE_INT_ACK    = 5,   // Interrupt acknowledge
     CYCLE_RESET      = 6,   // Reset (emitted when /RESET releases)
-    CYCLE_DATA_LOSS  = 7,   // Data loss marker (addr = lost count, data = loss cause)
 } cycle_type_t;
-
-// Data loss cause codes (stored in trace_record_t.data for CYCLE_DATA_LOSS)
-#define LOSS_DMA_OVERFLOW    1  // DMA ring buffer overrun — samples lost
-#define LOSS_PIO_OVERFLOW    2  // PIO FIFO stall — samples lost
-#define LOSS_STAGING_OVERFLOW 3 // Staging buffer full — records lost
-#define LOSS_POLL_TIMEOUT    4  // GPIO poll timed out — CLK stuck or too slow
 
 // Trace record produced by analyzer state machine (core 1 → PSRAM ring buffer)
 typedef struct {
@@ -191,14 +184,6 @@ typedef struct {
     uint32_t trigger_idx;      // psram_write_idx when trigger fired (valid in TRIGGERED/DONE)
     uint32_t trigger_count;    // number of configured triggers
     uint32_t wait_asserts;     // /WAIT assertion count
-    // Performance measurement (ARM cycle counts per process_sample call)
-    uint32_t sample_max_cycles; // worst-case cycles for any process_sample
-    uint32_t sample_min_cycles; // best-case cycles (0xFFFFFFFF if no samples)
-    // Data loss counters
-    uint32_t pio_overflows;    // PIO FIFO stall count (samples lost at source)
-    uint32_t staging_overflows; // staging buffer overrun count (records dropped)
-    uint32_t poll_timeouts;    // GPIO poll timeout count (CLK stuck/too slow)
-    uint32_t data_loss_records; // CYCLE_DATA_LOSS records emitted into trace
 } status_response_t;
 
 #endif // Z80_TRACE_H
